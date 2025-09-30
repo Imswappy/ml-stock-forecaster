@@ -315,12 +315,29 @@ if st.button("Compute CAPM"):
         st.error("After aligning dates, no overlapping data remains between the selected stocks and market. Try expanding years or upload CSVs with matching ranges.")
         st.stop()
 
+    # ---------------- Top Row: DataFrame head & tail ----------------
+    # Prepare display DataFrames with Date column for readability
+    disp_df = combined.reset_index().rename(columns={combined.reset_index().columns[0]: "Date"})
+    # format Date column as string for nicer dataframe display
+    try:
+        disp_df["Date"] = pd.to_datetime(disp_df["Date"]).dt.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+
+    head_col, tail_col = st.columns([1, 1])
+    with head_col:
+        st.subheader("Dataframe head")
+        st.dataframe(disp_df.head(5).reset_index(drop=True).round(4), use_container_width=True)
+    with tail_col:
+        st.subheader("Dataframe tail")
+        st.dataframe(disp_df.tail(5).reset_index(drop=True).round(4), use_container_width=True)
+
     # -------- Top: two charts side-by-side (Price & Normalized) --------
     chart_col1, chart_col2 = st.columns([1, 1])
     with chart_col1:
         st.subheader("Price of all the Stocks")
         try:
-            # plot raw prices (interactive_plot expects Date column if given DataFrame)
+            # plot raw prices (interactive_plot expects a DataFrame with Date column)
             plot_df = combined.reset_index().rename(columns={combined.reset_index().columns[0]:"Date"})
             st.plotly_chart(capm_functions.interactive_plot(plot_df), use_container_width=True)
         except Exception:
@@ -346,7 +363,7 @@ if st.button("Compute CAPM"):
         returns[col] = returns[col].pct_change().fillna(0) * 100.0
     returns = returns.rename(columns={"market_close":"sp500"})
 
-    # compute beta for each stock using capm_functions.calculate_beta if available
+    # compute beta list for display
     beta_list = []
     for s in stocks_list:
         if s not in returns.columns:

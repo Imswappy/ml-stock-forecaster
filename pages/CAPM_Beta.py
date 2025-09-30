@@ -1,63 +1,216 @@
-# importing libraries
-import streamlit as st
+# pages/CAPM_Beta.py
 import datetime
-import pandas_datareader.data as web
-import yfinance as yf
-import pandas as pd
-from pages.utils import capm_functions
+import math
+
 import numpy as np
-import plotly.express as px
+import pandas as pd
+import streamlit as st
 
-# setting page config
-st.set_page_config(
+# yfinance fallback
+try:
+    import yfinance as yf
+    HAVE_YF = True
+except Exception:
+    yf = None
+    HAVE_YF = False
 
-        page_title="CAPM",
-        page_icon="chart_with_upwards_trend",
-        layout="wide",
-    )
+from sklearn.linear_model import LinearRegression
 
-st.title('Calculate Beta and Return for individual stock')
+st.set_page_config(page_title="CAPM Beta", page_icon="📈", layout="wide")
+st.title("CAPM — Single-stock Beta & Expected Return")
 
-# getting input from user
-col1, col2 = st.columns([1,1])
+st.markdown(
+    """
+This page computes a stock's **beta** by regressing its returns against a market index's returns.
+
+Implementation notes:
+- The app **does not** import `pandas_datareader` at module load time (that package may fail to import on Python >=3.12).
+- If `pandas_datareader` can be imported successfully *at runtime*, it will be used; otherwise the app falls back to `yfinance`.
+"""
+)
+
+# --- Inputs
+col1, col2 = st.columns([1.5, 1])
 with col1:
-    stock = st.selectbox("Choose a stock" , ('AAPL','TSLA','NFLX','MGM','MSFT','AMZN','NVDA','GOOGL'))
+    ticker = st.text_input("Stock ticker", value="AAPL").strip().upper()
 with col2:
-    year = st.number_input("Number of Years",1,10)
+    index_symbol = st.text_input("Market index symbol", value="^GSPC").strip().upper()
 
-# downloading data for SP500
-end = datetime.date.today()
-start = datetime.date(datetime.date.today().year - year, datetime.date.today().month, datetime.date.today().day)
-SP500 = web.DataReader(['sp500'], 'fred', start, end)
+period_col1, period_col2 = st.columns(2)
+with period_col1:
+    years = st.slider("Years of history", 1, 10, 3)
+with period_col2:
+    freq = st.selectbox("Return frequency", options=["daily", "weekly", "monthly"], index=0)
 
-# downloading data for the stock
-stocks_df = yf.download(stock, period = f'{year}y')
-stocks_df = stocks_df[['Close']]
-stocks_df.columns = [f'{stock}']
-stocks_df.reset_index(inplace = True)
-SP500.reset_index(inplace = True)
-SP500.columns = ['Date','sp500']
-stocks_df['Date'] = stocks_df['Date'].astype('datetime64[ns]')
-stocks_df['Date'] = stocks_df['Date'].apply(lambda x:str(x)[:10])
-stocks_df['Date'] = pd.to_datetime(stocks_df['Date'])
-stocks_df = pd.merge(stocks_df, SP500, on = 'Date', how = 'inner')
+rf_col1, rf_col2 = st.columns([1, 1])
+with rf_col1:
+    rf_input = st.number_input("Risk-free rate (annual %, default 0)", value=0.0, step=0.01)
+    Rf = float(rf_input) / 100.0
+with rf_col2:
+    show_plot = st.checkbox("Show regression plot", value=True)
 
-# calculating daily return 
-stocks_daily_return = capm_functions.daily_return(stocks_df)
-rm = stocks_daily_return['sp500'].mean()*252
+start = (pd.Timestamp.today() - pd.DateOffset(years=years)).strftime("%Y-%m-%d")
+end = pd.Timestamp.today().strftime("%Y-%m-%d")
 
-# calculate beta and alpha
-beta, alpha = capm_functions.calculate_beta(stocks_daily_return, stock)
+st.markdown(f"**Data range:** {start} → {end}")
 
-# risk free rate of return
-rf = 0
+# --- Data fetch helper (lazy import of pandas_datareader) ---
+def fetch_prices(sym, start, end):
+    """
+    Fetch adjusted/close prices for a symbol.
+    Attempt to use pandas_datareader if it can be imported successfully at runtime;
+    otherwise fall back to yfinance. Return DataFrame with column 'Close' (or empty DF on failure).
+    """
+    # Try pandas_datareader only when safe to import
+    try:
+        # import inside function and protect against ANY import-time error (e.g. distutils missing)
+        import importlib
+        pdr_spec = importlib.util.find_spec("pandas_datareader")
+        if pdr_spec is not None:
+            try:
+                # Import and use DataReader, protected
+                from pandas_datareader import data as web
+                df = web.DataReader(sym, "yahoo", start, end)
+                if "Adj Close" in df.columns:
+                    df = df[["Adj Close"]].rename(columns={"Adj Close": "Close"})
+                else:
+                    df = df[["Close"]]
+                return df
+            except Exception:
+                # If pandas_datareader import/use fails, continue to yfinance fallback
+                pass
+    except Exception:
+        # Any unexpected exception when probing pandas_datareader -> fall back
+        pass
 
-# calculate return
-return_value = round(rf+(beta*(rm-rf)),2)
+    # yfinance fallback
+    if HAVE_YF:
+        try:
+            df = yf.download(sym, start=start, end=end, progress=False)
+            if df.empty:
+                return pd.DataFrame()
+            if "Adj Close" in df.columns:
+                df = df[["Adj Close"]].rename(columns={"Adj Close": "Close"})
+            else:
+                df = df[["Close"]]
+            return df
+        except Exception:
+            return pd.DataFrame()
 
-# showing results
-st.markdown(f'### Beta : {beta}')
-st.markdown(f'### Return  : {return_value}')
-fig = px.scatter(stocks_daily_return, x = 'sp500', y = stock, title = stock)
-fig.add_scatter(x = stocks_daily_return['sp500'], y = beta*stocks_daily_return['sp500'] + alpha,  name = 'Expected Return',line=dict(color="crimson"))
-st.plotly_chart(fig, use_container_width=True)
+    # neither available
+    return pd.DataFrame()
+
+# --- Compute Beta on button press ---
+if st.button("Compute Beta"):
+    if ticker == "" or index_symbol == "":
+        st.error("Please enter both a stock ticker and an index symbol.")
+    else:
+        with st.spinner("Fetching data..."):
+            stock_df = fetch_prices(ticker, start, end)
+            idx_df = fetch_prices(index_symbol, start, end)
+
+        if stock_df.empty:
+            st.error(f"Failed to fetch price data for {ticker}. Check symbol or network.")
+            st.stop()
+        if idx_df.empty:
+            st.error(f"Failed to fetch price data for market index {index_symbol}. Check symbol or network.")
+            st.stop()
+
+        # align on dates (inner join)
+        df = stock_df.join(idx_df, how="inner", lsuffix="_stock", rsuffix="_idx")
+        df.columns = ["Close_stock", "Close_idx"]
+
+        if df.empty or len(df) < 10:
+            st.error("Not enough overlapping data between stock and index to compute Beta (need more data).")
+            st.stop()
+
+        # compute returns according to frequency
+        if freq == "daily":
+            ret_stock = df["Close_stock"].pct_change().dropna()
+            ret_idx = df["Close_idx"].pct_change().dropna()
+        elif freq == "weekly":
+            ret_stock = df["Close_stock"].pct_change(periods=5).dropna()
+            ret_idx = df["Close_idx"].pct_change(periods=5).dropna()
+        else:  # monthly
+            ret_stock = df["Close_stock"].pct_change(periods=21).dropna()
+            ret_idx = df["Close_idx"].pct_change(periods=21).dropna()
+
+        # align returns
+        ret_df = pd.concat([ret_stock, ret_idx], axis=1).dropna()
+        ret_df.columns = ["R_i", "R_m"]
+
+        if ret_df.empty:
+            st.error("No overlapping returns after resampling. Try a different frequency or longer history.")
+            st.stop()
+
+        # convert to excess returns using Rf (annual -> period)
+        if freq == "daily":
+            periods_per_year = 252.0
+        elif freq == "weekly":
+            periods_per_year = 52.0
+        else:
+            periods_per_year = 12.0
+
+        period_rf = (1 + Rf) ** (1.0 / periods_per_year) - 1.0
+        ret_df["Ri_ex"] = ret_df["R_i"] - period_rf
+        ret_df["Rm_ex"] = ret_df["R_m"] - period_rf
+
+        # Linear regression for beta
+        X = ret_df["Rm_ex"].values.reshape(-1, 1)
+        y = ret_df["Ri_ex"].values
+        lr = LinearRegression()
+        lr.fit(X, y)
+        beta = float(lr.coef_[0])
+        alpha = float(lr.intercept_)
+
+        # alternative slope via polyfit
+        slope, intercept = np.polyfit(ret_df["Rm_ex"].values, ret_df["Ri_ex"].values, 1)
+
+        st.metric("Estimated Beta (LinearRegression slope)", f"{beta:.4f}")
+        st.write(f"Intercept (alpha): {alpha:.6f}")
+        st.write(f"Slope (polyfit): {slope:.6f} — should be similar to beta above")
+
+        # annualize beta-based expected return via CAPM
+        mean_rm = ret_df["R_m"].mean() * periods_per_year
+        expected_return = Rf + beta * (mean_rm - Rf)
+        st.write("Estimated market mean return (annualized):", f"{mean_rm:.3%}")
+        st.write("CAPM expected return (annualized):", f"{expected_return:.3%}")
+
+        # Interpretation
+        st.markdown("**Beta interpretation:**")
+        if beta > 1.0:
+            st.info("β > 1 : stock is more volatile than the market.")
+        elif beta < 1.0:
+            st.info("β < 1 : stock is less volatile than the market.")
+        else:
+            st.info("β = 1 : stock moves in line with the market.")
+
+        # Plot scatter + regression line
+        if show_plot:
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.scatter(ret_df["Rm_ex"], ret_df["Ri_ex"], alpha=0.6, label="observations")
+            xs = np.linspace(ret_df["Rm_ex"].min(), ret_df["Rm_ex"].max(), 100)
+            ys = slope * xs + intercept
+            ax.plot(xs, ys, color="red", label=f"fit: slope={slope:.3f}")
+            ax.set_xlabel("Market excess return")
+            ax.set_ylabel("Stock excess return")
+            ax.set_title(f"{ticker} vs {index_symbol} — Beta regression")
+            ax.legend()
+            st.pyplot(fig)
+
+        st.subheader("Sample of returns used")
+        st.dataframe(
+            ret_df.tail(50)
+            .assign(Ri=lambda d: d["R_i"].round(5), Rm=lambda d: d["R_m"].round(5))[["Ri", "Rm"]]
+        )
+
+# If neither backend available
+if not HAVE_YF:
+    st.error(
+        "No price-fetch backend available. Install `yfinance` in your environment.\n\n"
+        "Quick fix (shell):\n"
+        "  pip install yfinance\n\n"
+        "Then restart the Streamlit app."
+    )

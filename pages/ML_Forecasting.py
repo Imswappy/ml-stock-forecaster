@@ -1,8 +1,8 @@
 # pages/ML_Forecasting.py
 import io
+import importlib
 import os
 import time
-
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -353,9 +353,55 @@ def run_optuna_rf(Xtr, ytr, trials=20):
     model.fit(Xtr, ytr)
     return model, best
 
+# ---------- AlphaVantage diagnostic block ----------
+st.markdown("---")
+st.subheader("AlphaVantage diagnostic (optional)")
+av_key = None
+try:
+    av_key = st.secrets.get("ALPHAVANTAGE_API_KEY") if hasattr(st, "secrets") else None
+except Exception:
+    av_key = None
+if not av_key:
+    av_key = os.environ.get("ALPHAVANTAGE_API_KEY")
+
+st.write("ALPHAVANTAGE key present:", bool(av_key))
+if av_key:
+    av_test_symbol = st.text_input("AlphaVantage test symbol", value="AAPL", key="av_test_sym")
+    if st.button("Run AlphaVantage test"):
+        import requests
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function":"TIME_SERIES_DAILY_ADJUSTED",
+            "symbol": av_test_symbol,
+            "outputsize":"compact",
+            "apikey": av_key,
+            "datatype":"json"
+        }
+        with st.spinner("Calling AlphaVantage..."):
+            try:
+                r = requests.get(url, params=params, timeout=20)
+                st.write("HTTP status:", r.status_code)
+                try:
+                    j = r.json()
+                    st.write("Returned top-level keys:", list(j.keys())[:10])
+                    if "Note" in j:
+                        st.error("Rate limit note from AlphaVantage:\n" + j["Note"])
+                    if "Error Message" in j:
+                        st.error("AlphaVantage Error Message:\n" + j["Error Message"])
+                    if "Time Series (Daily)" in j or "Time Series (Daily Adjusted)" in j:
+                        st.success("AlphaVantage returned time series data.")
+                        ts = j.get("Time Series (Daily)") or j.get("Time Series (Daily Adjusted)")
+                        df = pd.DataFrame.from_dict(ts, orient="index").head(3)
+                        st.dataframe(df)
+                except Exception:
+                    st.text("Response text (first 2000 chars):")
+                    st.text(r.text[:2000])
+            except Exception as e:
+                st.error(f"AlphaVantage request failed: {e}")
+st.markdown("---")
+
 # ---------- Auto-forecast & quick inference (if a saved model is loaded) ----------
 if LOADED_MODEL is not None:
-    st.markdown("---")
     st.subheader("Quick inference from loaded model")
     st.write("This will fetch recent data, build features matching the saved model, and do a 7-day recursive forecast.")
     if 'features' not in LOADED_MODEL or LOADED_MODEL['features'] is None:
@@ -420,8 +466,6 @@ if LOADED_MODEL is not None:
                                 st.table(forecast_df.round(3))
 
                                 st.success("Quick forecast completed.")
-                except Exception as e:
-                    st.error(f"Quick forecast failed: {e}")
 
 # --------- Training pipeline ----------
 if run_button:
@@ -447,7 +491,10 @@ if run_button:
         st.stop()
 
     st.success(f"Fetched {len(data)} rows for {ticker}")
-    st.write(data.tail())
+    st.markdown("### Dataframe head")
+    st.dataframe(data.head().round(6))
+    st.markdown("### Dataframe tail")
+    st.dataframe(data.tail().round(6))
 
     df_feat = add_lag_features(data, n_lags)
     if add_tech:

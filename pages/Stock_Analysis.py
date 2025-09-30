@@ -19,11 +19,13 @@ except Exception:
 from pages.utils.plotly_figure import (MACD, RSI, Moving_average, candlestick,
                                        close_chart, plotly_table)
 
-# Page config (must be first Streamlit call in page)
+# Page config
 st.set_page_config(page_title="Stock Analysis", page_icon="📊", layout="wide")
 st.title("📊 Stock Analysis")
 
+# -----------------------
 # Controls
+# -----------------------
 col1, col2, col3 = st.columns(3)
 today = datetime.date.today()
 
@@ -40,7 +42,8 @@ uploaded_csv = st.file_uploader(
     "Optional: Upload CSV (Date + Close or Adj Close) to use instead of network", type=["csv"]
 )
 
-show_diag = st.checkbox("Show fetch diagnostics (useful for debugging)", value=False)
+show_diag = st.checkbox("Show fetch diagnostics (useful for debugging)", value=True)
+force_twelvedata = st.checkbox("Force use Twelve Data (if key available)", value=False)
 
 # -----------------------------
 # CSV Parser
@@ -90,22 +93,15 @@ def parse_uploaded_csv_bytes(b: bytes) -> pd.DataFrame:
             out_cols.append(k)
 
     out = df[out_cols].rename(columns={close_col: "Close"})
-    # ensure numeric
     for c in out.columns:
         out[c] = pd.to_numeric(out[c], errors="coerce")
     out = out.dropna(how="all")
     return out
 
 # -----------------------------
-# Twelve Data helper (diagnostic)
+# Twelve Data helper
 # -----------------------------
-def fetch_from_twelvedata(
-    symbol: str, start_dt: str, end_dt: str, show_diag: bool = False
-) -> pd.DataFrame:
-    """
-    Fetch daily series from Twelve Data (JSON). Requires TWELVEDATA_API_KEY in st.secrets or env.
-    Returns DataFrame with Close, Open, High, Low, Volume when available.
-    """
+def fetch_from_twelvedata(symbol: str, start_dt: str, end_dt: str, show_diag: bool = False) -> pd.DataFrame:
     td_key = None
     try:
         td_key = st.secrets.get("TWELVEDATA_API_KEY")
@@ -138,8 +134,8 @@ def fetch_from_twelvedata(
 
     if show_diag:
         st.write(f"Twelve Data HTTP {r.status_code} for {symbol}")
-        txt = r.text or ""
-        st.code(txt[:1000] + ("... (truncated)" if len(txt) > 1000 else ""))
+        snippet = (r.text or "")[:1000]
+        st.code(snippet + ("... (truncated)" if len(r.text or "") > 1000 else ""))
 
     if r.status_code != 200:
         return pd.DataFrame()
@@ -149,8 +145,10 @@ def fetch_from_twelvedata(
     except Exception:
         return pd.DataFrame()
 
-    # detect error messages
-    if isinstance(j, dict) and (j.get("status") == "error" or j.get("message")):
+    # check for API error
+    if isinstance(j, dict) and j.get("status") == "error":
+        if show_diag:
+            st.error(f"Twelve Data error: {j.get('message') or j}")
         return pd.DataFrame()
 
     values = j.get("values") if isinstance(j, dict) else None
@@ -158,7 +156,6 @@ def fetch_from_twelvedata(
         return pd.DataFrame()
 
     df = pd.DataFrame(values)
-    # unify index names
     if "datetime" in df.columns:
         df["datetime"] = pd.to_datetime(df["datetime"])
         df = df.set_index("datetime").sort_index()
@@ -190,7 +187,7 @@ def fetch_from_twelvedata(
     return out
 
 # -----------------------------
-# Alpha Vantage fallback (metadata + optional CSV)
+# Alpha Vantage fallback
 # -----------------------------
 def fetch_from_alphavantage(symbol: str, start_dt: str, end_dt: str, show_diag: bool = False) -> pd.DataFrame:
     av_key = None
@@ -226,15 +223,16 @@ def fetch_from_alphavantage(symbol: str, start_dt: str, end_dt: str, show_diag: 
 
     ts = j.get("Time Series (Daily)") or j.get("Time Series (Daily Adjusted)")
     if not ts:
+        if show_diag:
+            st.warning("AlphaVantage returned no time series (might be rate-limited).")
         return pd.DataFrame()
 
     df = pd.DataFrame.from_dict(ts, orient="index")
     df.index = pd.to_datetime(df.index)
-    # map columns
     col_map = {}
     for c in df.columns:
         lc = c.lower()
-        if "adjusted close" in lc or lc.endswith("adjusted close") or "5. adjusted close" in lc:
+        if "adjusted close" in lc or "5. adjusted close" in lc:
             col_map[c] = "Adj Close"
         elif "close" in lc:
             col_map[c] = "Close"
@@ -250,7 +248,6 @@ def fetch_from_alphavantage(symbol: str, start_dt: str, end_dt: str, show_diag: 
     for col in ["Close", "Adj Close", "Open", "High", "Low", "Volume"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    # prefer Adj Close if present
     if "Adj Close" in df.columns and "Close" not in df.columns:
         df = df.rename(columns={"Adj Close": "Close"})
     cols = [c for c in ["Close", "Open", "High", "Low", "Volume"] if c in df.columns]
@@ -260,10 +257,10 @@ def fetch_from_alphavantage(symbol: str, start_dt: str, end_dt: str, show_diag: 
     return out
 
 # -----------------------------
-# Higher-level fetch_history (cached)
+# High-level fetch (cached)
 # -----------------------------
 @st.cache_data(ttl=3600)
-def fetch_history(ticker_sym: str, start_dt: str, end_dt: str, uploaded_bytes: Optional[bytes], show_diag: bool = False) -> pd.DataFrame:
+def fetch_history(ticker_sym: str, start_dt: str, end_dt: str, uploaded_bytes: Optional[bytes], show_diag: bool = False, force_td: bool = False) -> pd.DataFrame:
     # 0) uploaded CSV
     if uploaded_bytes is not None:
         parsed = parse_uploaded_csv_bytes(uploaded_bytes)
@@ -272,8 +269,14 @@ def fetch_history(ticker_sym: str, start_dt: str, end_dt: str, uploaded_bytes: O
                 st.info("Using uploaded CSV for historical prices.")
             return parsed
 
-    # 1) yfinance.download
-    if HAVE_YF:
+    # if forced, try Twelve Data first
+    if force_td:
+        td = fetch_from_twelvedata(ticker_sym, start_dt, end_dt, show_diag=show_diag)
+        if not td.empty:
+            return td
+
+    # 1) yfinance.download (if available)
+    if HAVE_YF and not force_td:
         try:
             df = yf.download(ticker_sym, start=start_dt, end=end_dt, progress=False)
             if (df is None) or df.empty:
@@ -294,7 +297,7 @@ def fetch_history(ticker_sym: str, start_dt: str, end_dt: str, uploaded_bytes: O
             if show_diag:
                 st.warning(f"yfinance exception: {e}")
 
-    # 2) Twelve Data fallback
+    # 2) Twelve Data (default second)
     td = fetch_from_twelvedata(ticker_sym, start_dt, end_dt, show_diag=show_diag)
     if not td.empty:
         return td
@@ -304,16 +307,15 @@ def fetch_history(ticker_sym: str, start_dt: str, end_dt: str, uploaded_bytes: O
     if not av.empty:
         return av
 
-    # nothing worked
     return pd.DataFrame()
 
 # -----------------------------
-# Metadata fetcher (Twelve Data / AlphaVantage / yfinance)
+# Company metadata (tries TD -> AV -> yfinance)
 # -----------------------------
 def fetch_company_metadata(ticker_sym: str, show_diag: bool = False) -> dict:
     meta = {"summary": None, "sector": None, "employees": None, "website": None, "ratios": {}}
 
-    # try Twelve Data ("symbol" / "name" may exist) -> Twelve Data doesn't always provide company profile on free tier
+    # try Twelve Data profile endpoint
     td_key = None
     try:
         td_key = st.secrets.get("TWELVEDATA_API_KEY")
@@ -324,18 +326,15 @@ def fetch_company_metadata(ticker_sym: str, show_diag: bool = False) -> dict:
 
     if td_key:
         try:
-            # Twelve Data has a "profile" endpoint
             url = "https://api.twelvedata.com/company_profile"
             r = requests.get(url, params={"symbol": ticker_sym, "apikey": td_key}, timeout=10)
             if r.status_code == 200:
                 j = r.json()
-                # sample keys: name, description, industry, employees, website
                 if isinstance(j, dict) and j.get("name"):
                     meta["summary"] = j.get("description")
                     meta["sector"] = j.get("industry") or j.get("sector")
                     meta["employees"] = j.get("employees")
                     meta["website"] = j.get("website")
-                    # no ratios typically
                     if show_diag:
                         st.success("Fetched company profile from Twelve Data")
                     return meta
@@ -368,11 +367,6 @@ def fetch_company_metadata(ticker_sym: str, show_diag: bool = False) -> dict:
                         "Beta": j.get("Beta"),
                         "EPS (trailing)": j.get("EPS"),
                         "PE Ratio (trailing)": j.get("PERatio"),
-                        "Quick Ratio": j.get("QuickRatio"),
-                        "Revenue per share": j.get("RevenuePerShareTTM"),
-                        "Profit Margins": j.get("ProfitMargin"),
-                        "Debt to Equity": j.get("DebtToEquity"),
-                        "Return on Equity": j.get("ReturnOnEquityTTM"),
                     }
                     if show_diag:
                         st.success("Fetched company metadata from AlphaVantage")
@@ -381,26 +375,22 @@ def fetch_company_metadata(ticker_sym: str, show_diag: bool = False) -> dict:
             if show_diag:
                 st.warning("AlphaVantage overview attempt failed.")
 
-    # Finally try yfinance safe calls (guarded)
+    # yfinance fallback
     if HAVE_YF:
         try:
             t = yf.Ticker(ticker_sym)
-            # try get_info via get_info() which may raise; catch exceptions
             try:
                 info = t.get_info()
             except Exception:
                 info = {}
-            # try fast_info as fallback
             try:
                 fast = t.fast_info or {}
             except Exception:
                 fast = {}
-            # prefer fields in order
             meta["summary"] = info.get("longBusinessSummary") or meta["summary"]
             meta["sector"] = info.get("sector") or info.get("industry") or fast.get("industry")
             meta["employees"] = info.get("fullTimeEmployees") or fast.get("employees")
             meta["website"] = info.get("website") or info.get("websiteAddress")
-            # ratios from info (if present)
             if info:
                 meta["ratios"].update(
                     {
@@ -419,7 +409,7 @@ def fetch_company_metadata(ticker_sym: str, show_diag: bool = False) -> dict:
     return meta
 
 # -----------------------------
-# Render page
+# Render
 # -----------------------------
 st.header(f"{ticker} — Overview")
 
@@ -479,20 +469,51 @@ with col_right:
 st.markdown("---")
 
 # -----------------------------
-# Fetch prices
+# Test Twelve Data key button (visible to user)
+# -----------------------------
+td_test_col1, td_test_col2 = st.columns([3, 1])
+with td_test_col1:
+    st.caption("If you set `TWELVEDATA_API_KEY`, press the test button to validate it from this environment.")
+with td_test_col2:
+    if st.button("Test Twelve Data key"):
+        td_key = None
+        try:
+            td_key = st.secrets.get("TWELVEDATA_API_KEY")
+        except Exception:
+            td_key = None
+        if not td_key:
+            td_key = os.environ.get("TWELVEDATA_API_KEY")
+        if not td_key:
+            st.error("No TWELVEDATA_API_KEY found in Streamlit secrets or environment.")
+        else:
+            r = requests.get("https://api.twelvedata.com/time_series", params={"symbol": "AAPL", "interval": "1day", "apikey": td_key, "outputsize": 1})
+            st.write("HTTP status:", r.status_code)
+            try:
+                st.json(r.json())
+            except Exception:
+                st.text(r.text[:1000])
+
+# -----------------------------
+# Fetch prices and render charts/head/tail
 # -----------------------------
 uploaded_bytes = uploaded_csv.read() if uploaded_csv else None
-data = fetch_history(ticker, start_date.isoformat(), end_date.isoformat(), uploaded_bytes, show_diag=show_diag)
+data = fetch_history(
+    ticker,
+    start_date.isoformat(),
+    end_date.isoformat(),
+    uploaded_bytes,
+    show_diag=show_diag,
+    force_td=(force_twelvedata or False),
+)
 
 if data is None or data.empty:
-    # Helpful error message with next steps
     st.error(
         "No historical price data available. Check ticker/network, upload CSV, or set TWELVEDATA_API_KEY / ALPHAVANTAGE_API_KEY in Streamlit secrets or environment."
     )
     if show_diag:
         st.caption("Diagnostics were enabled — check the messages above for HTTP / response details.")
 else:
-    # display small summary metrics
+    # small summary metrics
     try:
         daily_change = data["Close"].iloc[-1] - data["Close"].iloc[-2]
     except Exception:
@@ -534,7 +555,6 @@ else:
         else:
             indicator = st.selectbox("Indicator", ("RSI", "Moving Average", "MACD"))
 
-    # Render charts (use the fetched 'data')
     def safe_plot(func, df_in, period_arg="1y"):
         try:
             fig = func(df_in, period_arg)
@@ -559,6 +579,7 @@ else:
 
 st.markdown("---")
 st.caption(
-    "Notes: Price fetching order: uploaded CSV → yfinance → Twelve Data → AlphaVantage. "
-    "Set `TWELVEDATA_API_KEY` and/or `ALPHAVANTAGE_API_KEY` in Streamlit secrets (recommended) or environment variables."
+    "Notes: Price fetching order (by default): uploaded CSV → yfinance → Twelve Data → AlphaVantage. "
+    "Tick the 'Force use Twelve Data' box to try Twelve Data first. "
+    "Set `TWELVEDATA_API_KEY` and/or `ALPHAVANTAGE_API_KEY` in Streamlit secrets or environment variables."
 )

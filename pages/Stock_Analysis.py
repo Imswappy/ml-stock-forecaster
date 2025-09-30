@@ -24,7 +24,7 @@ st.set_page_config(
     page_icon="📊",
     layout="wide",
 )
-st.title("Stock Analysis")
+st.title("📊 Stock Analysis")
 
 # Controls
 col1, col2, col3 = st.columns(3)
@@ -43,7 +43,9 @@ uploaded_csv = st.file_uploader(
     "Optional: Upload CSV (Date + Close or Adj Close)", type=["csv"]
 )
 
-# --- CSV Helper
+# -----------------------------
+# CSV Parser
+# -----------------------------
 def parse_uploaded_csv_bytes(b):
     try:
         df = pd.read_csv(io.BytesIO(b))
@@ -52,6 +54,7 @@ def parse_uploaded_csv_bytes(b):
             df = pd.read_csv(io.StringIO(b.decode()))
         except Exception:
             return pd.DataFrame()
+
     # detect date column
     date_col = None
     for c in df.columns:
@@ -60,9 +63,11 @@ def parse_uploaded_csv_bytes(b):
             break
     if not date_col:
         date_col = df.columns[0]
+
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     df = df.set_index(date_col).sort_index()
-    # close column
+
+    # detect close column
     close_col = None
     for c in df.columns:
         if c.lower() in ("adj close", "adjusted_close", "adjusted close"):
@@ -75,13 +80,17 @@ def parse_uploaded_csv_bytes(b):
                 break
     if not close_col:
         return pd.DataFrame()
+
     out_cols = [close_col]
     for k in ["Open", "High", "Low", "Volume"]:
         if k in df.columns:
             out_cols.append(k)
+
     return df[out_cols].rename(columns={close_col: "Close"})
 
-# --- Price fetcher
+# -----------------------------
+# Price history (yfinance only)
+# -----------------------------
 @st.cache_data(ttl=3600)
 def fetch_history(ticker_sym, start_dt, end_dt, uploaded_bytes=None):
     # 1. Uploaded CSV
@@ -97,75 +106,26 @@ def fetch_history(ticker_sym, start_dt, end_dt, uploaded_bytes=None):
             if df is not None and not df.empty:
                 if "Adj Close" in df.columns and "Close" not in df.columns:
                     df = df.rename(columns={"Adj Close": "Close"})
-                cols = [
-                    c for c in ["Close", "Open", "High", "Low", "Volume"] if c in df.columns
-                ]
+                cols = [c for c in ["Close", "Open", "High", "Low", "Volume"] if c in df.columns]
                 return df[cols].dropna()
         except Exception:
-            pass
-
-    # 3. Alpha Vantage fallback
-    av_key = (
-        st.secrets.get("ALPHAVANTAGE_API_KEY", None)
-        if hasattr(st, "secrets")
-        else os.environ.get("ALPHAVANTAGE_API_KEY")
-    )
-    if av_key:
-        try:
-            url = "https://www.alphavantage.co/query"
-            params = {
-                "function": "TIME_SERIES_DAILY_ADJUSTED",
-                "symbol": ticker_sym,
-                "outputsize": "full",
-                "apikey": av_key,
-            }
-            r = requests.get(url, params=params, timeout=15)
-            if r.status_code == 200:
-                j = r.json()
-                ts = j.get("Time Series (Daily)") or j.get("Time Series (Daily Adjusted)")
-                if ts:
-                    df = pd.DataFrame.from_dict(ts, orient="index")
-                    df.index = pd.to_datetime(df.index)
-                    df = df.rename(
-                        columns={
-                            "1. open": "Open",
-                            "2. high": "High",
-                            "3. low": "Low",
-                            "4. close": "Close",
-                            "5. adjusted close": "Adj Close",
-                            "6. volume": "Volume",
-                        }
-                    )
-                    # ensure numeric
-                    for c in df.columns:
-                        df[c] = pd.to_numeric(df[c], errors="coerce")
-                    cols = [
-                        c
-                        for c in ["Close", "Open", "High", "Low", "Volume"]
-                        if c in df.columns
-                    ]
-                    out = df[cols].sort_index().loc[start_dt:end_dt]
-                    return out.dropna()
-        except Exception as e:
-            st.warning(f"Alpha Vantage fetch failed: {e}")
+            return pd.DataFrame()
 
     return pd.DataFrame()
 
-# --- Metadata fetcher
+# -----------------------------
+# Metadata (Alpha Vantage + fallback)
+# -----------------------------
 def fetch_company_metadata(ticker_sym):
-    meta = {
-        "summary": None,
-        "sector": None,
-        "employees": None,
-        "website": None,
-        "ratios": {},
-    }
+    meta = {"summary": None, "sector": None, "employees": None, "website": None, "ratios": {}}
 
-    av_key = (
-        st.secrets.get("ALPHAVANTAGE_API_KEY", None)
-        if hasattr(st, "secrets")
-        else os.environ.get("ALPHAVANTAGE_API_KEY")
-    )
+    # 1. Alpha Vantage overview
+    av_key = None
+    try:
+        av_key = st.secrets.get("ALPHAVANTAGE_API_KEY", None)
+    except Exception:
+        av_key = os.environ.get("ALPHAVANTAGE_API_KEY")
+
     if av_key:
         try:
             url = "https://www.alphavantage.co/query"
@@ -193,6 +153,7 @@ def fetch_company_metadata(ticker_sym):
         except Exception:
             pass
 
+    # 2. yfinance fallback (only for basic metadata)
     if HAVE_YF:
         try:
             info = yf.Ticker(ticker_sym).get_info()
@@ -205,7 +166,9 @@ def fetch_company_metadata(ticker_sym):
 
     return meta
 
-# --- Render
+# -----------------------------
+# Render Metadata
+# -----------------------------
 st.header(f"{ticker} — Overview")
 
 meta = fetch_company_metadata(ticker)
@@ -229,30 +192,28 @@ with meta_cols[2]:
 
 # Ratios
 left_df = pd.DataFrame(
-    index=["Market Cap", "Beta", "EPS (trailing)", "PE Ratio (trailing)"]
+    {
+        "value": [
+            meta["ratios"].get("Market Cap"),
+            meta["ratios"].get("Beta"),
+            meta["ratios"].get("EPS (trailing)"),
+            meta["ratios"].get("PE Ratio (trailing)"),
+        ]
+    },
+    index=["Market Cap", "Beta", "EPS (trailing)", "PE Ratio (trailing)"],
 )
-left_df["value"] = [
-    meta["ratios"].get("Market Cap"),
-    meta["ratios"].get("Beta"),
-    meta["ratios"].get("EPS (trailing)"),
-    meta["ratios"].get("PE Ratio (trailing)"),
-]
 right_df = pd.DataFrame(
-    index=[
-        "Quick Ratio",
-        "Revenue per share",
-        "Profit Margins",
-        "Debt to Equity",
-        "Return on Equity",
-    ]
+    {
+        "value": [
+            meta["ratios"].get("Quick Ratio"),
+            meta["ratios"].get("Revenue per share"),
+            meta["ratios"].get("Profit Margins"),
+            meta["ratios"].get("Debt to Equity"),
+            meta["ratios"].get("Return on Equity"),
+        ]
+    },
+    index=["Quick Ratio", "Revenue per share", "Profit Margins", "Debt to Equity", "Return on Equity"],
 )
-right_df["value"] = [
-    meta["ratios"].get("Quick Ratio"),
-    meta["ratios"].get("Revenue per share"),
-    meta["ratios"].get("Profit Margins"),
-    meta["ratios"].get("Debt to Equity"),
-    meta["ratios"].get("Return on Equity"),
-]
 
 col_left, col_right = st.columns(2)
 with col_left:
@@ -262,17 +223,16 @@ with col_right:
 
 st.markdown("---")
 
-# Fetch prices
+# -----------------------------
+# Render Price Data + Charts
+# -----------------------------
 uploaded_bytes = uploaded_csv.read() if uploaded_csv else None
-data = fetch_history(
-    ticker, start_date.isoformat(), end_date.isoformat(), uploaded_bytes
-)
+data = fetch_history(ticker, start_date.isoformat(), end_date.isoformat(), uploaded_bytes)
 
 if data.empty:
-    st.error(
-        "No historical price data available. Check ticker/network, upload CSV, or set ALPHAVANTAGE_API_KEY."
-    )
+    st.error("No historical price data available. Check ticker/network or upload a CSV.")
 else:
+    # metrics
     try:
         daily_change = data["Close"].iloc[-1] - data["Close"].iloc[-2]
     except Exception:
@@ -300,9 +260,7 @@ else:
         if chart_type == "Candle":
             indicator = st.selectbox("Indicator", ("RSI", "MACD"))
         else:
-            indicator = st.selectbox(
-                "Indicator", ("RSI", "Moving Average", "MACD")
-            )
+            indicator = st.selectbox("Indicator", ("RSI", "Moving Average", "MACD"))
 
     def safe_plot(func):
         try:
@@ -326,7 +284,4 @@ else:
         elif indicator == "MACD":
             safe_plot(MACD)
 
-st.caption(
-    "Notes: Uses Alpha Vantage for metadata and price fallback. "
-    "Set `ALPHAVANTAGE_API_KEY` in Streamlit secrets or environment."
-)
+st.caption("Notes: Alpha Vantage is used only for metadata. Historical prices come from yfinance (or uploaded CSV).")

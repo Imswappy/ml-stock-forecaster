@@ -9,7 +9,7 @@ streamlit>=1.22.0,<1.40.0
 numpy>=2.1.0,<2.4.0
 pandas>=2.2.3,<2.6.0
 pandas-datareader
-distutils
+setuptools
 
 # market data + TA
 yfinance==0.2.25

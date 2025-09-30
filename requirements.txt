@@ -1,29 +1,32 @@
-# core app
-streamlit==1.12.2
-pandas==1.4.3
-numpy==1.23.2
+# Core
+streamlit==1.20.0
 
-# market data + utilities
-yfinance==0.1.74
-pandas-datareader==0.10.0
-ta==0.10.2            # technical indicators (preferred over pandas_ta)
+# Numerical / data
+numpy>=2.1.0,<2.4.0
+pandas>=2.2.3,<2.6.0
 
-# plotting / viz
-plotly==5.10.0
-matplotlib==3.5.3
+# Market data & TA
+yfinance==0.2.25
+ta==0.10.2
+
+# Visualization
+plotly==5.15.0
+matplotlib==3.7.1
 
 # ML / stats
-scikit-learn==1.1.2
-statsmodels==0.13.2
-joblib==1.1.0
+scikit-learn>=1.6.0,<1.9.0
+statsmodels>=0.14.0
 
-# convenience / small deps used by Streamlit or imported in files
-python-dateutil==2.8.2
-requests==2.28.1
+# Utilities
+joblib>=1.2.0
+python-dateutil>=2.8.2
+requests>=2.28.1
 
-# API / serving (optional if you use FastAPI)
-fastapi==0.95.2
-uvicorn==0.18.3
-# xgboost==1.7.6
-# optuna==3.0.0
-# tensorflow==2.11.0
+# API (optional)
+fastapi>=0.95.0
+uvicorn>=0.18.3
+
+# Optional heavy (uncomment if your deployment supports them)
+# xgboost>=1.7.6
+# optuna>=3.0.0
+# tensorflow>=2.11.0

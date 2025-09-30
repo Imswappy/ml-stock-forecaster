@@ -1,4 +1,5 @@
 # pages/ML_Forecasting.py
+import io
 import os
 import time
 
@@ -92,6 +93,8 @@ with col3:
 add_tech = st.checkbox("Add simple technical indicators (SMA, RSI)", value=True)
 train_frac = st.slider("Train fraction", 0.6, 0.95, 0.9, 0.01)
 
+csv_upload = st.file_uploader("Optional: upload CSV (Date + Close or Adj Close) to use instead of network", type=["csv"])
+
 st.markdown("### Tuning options (compute heavy)")
 use_tuning = st.checkbox("Enable hyperparameter tuning?", value=False)
 tuning_algo = st.selectbox("Tuning algorithm", options=["RandomizedSearchCV", "Optuna (if installed)"])
@@ -109,12 +112,128 @@ run_button = st.button("Fetch + Train (may take time)")
 
 # --------- Helpers ----------
 @st.cache_data(ttl=3600)
-def fetch_data(ticker, years):
-    df = yf.download(ticker, period=f"{years}y", progress=False)
-    if df.empty:
-        return df
-    df = df[['Close', 'Open', 'High', 'Low', 'Volume']].dropna()
-    return df
+def fetch_data(ticker, years, uploaded_csv_bytes=None, show_diagnostics=False):
+    """
+    Robust fetch:
+    1) If uploaded_csv_bytes provided -> parse CSV
+    2) Try yfinance.download(period=years)
+    3) Try yf.Ticker(...).history(period=years) (fallback)
+    4) Try pandas_datareader/stooq (lazy import)
+    Returns DataFrame with ['Close','Open','High','Low','Volume'] or empty DF.
+    """
+    # Helper to parse CSV bytes
+    def parse_csv_bytes(b):
+        try:
+            df = pd.read_csv(io.BytesIO(b))
+        except Exception:
+            try:
+                df = pd.read_csv(io.StringIO(b.decode()))
+            except Exception:
+                return pd.DataFrame()
+        # try to find date col
+        date_col = None
+        for c in df.columns:
+            if c.lower() in ("date", "timestamp", "time"):
+                date_col = c
+                break
+        if date_col is None:
+            date_col = df.columns[0]
+        try:
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        except Exception:
+            return pd.DataFrame()
+        df = df.set_index(date_col).sort_index()
+        # pick Close/Adj Close
+        close_col = None
+        for c in df.columns:
+            if c.lower() in ("adj close", "adjusted_close", "adjusted close"):
+                close_col = c
+                break
+        if close_col is None:
+            for c in df.columns:
+                if c.lower() == "close":
+                    close_col = c
+                    break
+        if close_col is None:
+            return pd.DataFrame()
+        # attempt to also keep Open/High/Low/Volume if present
+        cols = []
+        for k in ["Open", "High", "Low", "Close", "Volume", "Adj Close"]:
+            if k in df.columns:
+                cols.append(k)
+        # ensure Close is present
+        if close_col not in cols:
+            cols.append(close_col)
+        out = df[cols].rename(columns={close_col: "Close"})
+        out = out[["Close"] + [c for c in ["Open", "High", "Low", "Volume"] if c in out.columns]]
+        return out
+
+    # 0) Uploaded CSV
+    if uploaded_csv_bytes is not None:
+        parsed = parse_csv_bytes(uploaded_csv_bytes)
+        if not parsed.empty:
+            if show_diagnostics:
+                st.info("Using uploaded CSV for data.")
+            return parsed
+
+    # 1) yfinance.download
+    try:
+        df = yf.download(ticker, period=f"{years}y", progress=False)
+        if df is not None and not df.empty:
+            df = df[['Close', 'Open', 'High', 'Low', 'Volume']].dropna()
+            if show_diagnostics:
+                st.info(f"Fetched {len(df)} rows from yfinance.download for {ticker}")
+            return df
+    except Exception as e:
+        if show_diagnostics:
+            st.warning(f"yfinance.download failed for {ticker}: {e}")
+
+    # 2) yf.Ticker.history (fallback)
+    try:
+        t = yf.Ticker(ticker)
+        df = t.history(period=f"{years}y", actions=False)
+        if df is not None and not df.empty:
+            # sometimes columns differ; normalize
+            cols = []
+            for c in ["Close", "Open", "High", "Low", "Volume", "Adj Close"]:
+                if c in df.columns:
+                    cols.append(c)
+            if "Adj Close" in df.columns and "Close" not in df.columns:
+                df = df.rename(columns={"Adj Close": "Close"})
+            if "Close" in df.columns:
+                out = df[['Close'] + [c for c in ["Open", "High", "Low", "Volume"] if c in df.columns]]
+                out = out.dropna()
+                if not out.empty:
+                    if show_diagnostics:
+                        st.info(f"Fetched {len(out)} rows from yf.Ticker.history for {ticker}")
+                    return out
+    except Exception as e:
+        if show_diagnostics:
+            st.warning(f"yf.Ticker.history failed for {ticker}: {e}")
+
+    # 3) pandas_datareader -> stooq (lazy)
+    try:
+        pdr_spec = importlib.util.find_spec("pandas_datareader")
+        if pdr_spec is not None:
+            try:
+                from pandas_datareader import data as pdr
+                start = (pd.Timestamp.today() - pd.DateOffset(years=years)).strftime("%Y-%m-%d")
+                end = pd.Timestamp.today().strftime("%Y-%m-%d")
+                df = pdr.DataReader(ticker, "stooq", start, end)
+                if df is not None and not df.empty:
+                    if "Close" in df.columns:
+                        out = df[["Close", "Open", "High", "Low"]].sort_index().dropna()
+                        if show_diagnostics:
+                            st.info(f"Fetched {len(out)} rows from pandas_datareader(stooq) for {ticker}")
+                        return out
+            except Exception as e:
+                if show_diagnostics:
+                    st.warning(f"pandas_datareader(stooq) failed for {ticker}: {e}")
+    except Exception:
+        pass
+
+    # all failed -> return empty DF
+    return pd.DataFrame()
 
 def add_lag_features(df, n_lags):
     df2 = df.copy()
@@ -191,15 +310,16 @@ if LOADED_MODEL is not None:
     if 'features' not in LOADED_MODEL or LOADED_MODEL['features'] is None:
         st.warning("Loaded model does not contain a `features` list — cannot auto-build features.")
     else:
-        do_quick = st.button("Auto-forecast 7 days with loaded model")
+        do_quick = st.button("Auto-forecast 7 days with loaded model (uses network or uploaded CSV)")
         if do_quick:
             with st.spinner("Fetching recent market data and running forecast..."):
                 try:
                     # fetch a bit more history to compute indicators / lags
                     recent_days = max(60, n_lags * 3)
-                    df_recent = fetch_data(ticker, 1)  # 1 year is fine; we'll pick tail
+                    uploaded_bytes = csv_upload.read() if csv_upload is not None else None
+                    df_recent = fetch_data(ticker, 1, uploaded_csv_bytes=uploaded_bytes, show_diagnostics=True)
                     if df_recent.empty:
-                        st.error("Failed to fetch recent data for ticker.")
+                        st.error("Failed to fetch recent data for ticker. Try uploading a CSV or check network/ticker symbol.")
                     else:
                         df_recent = df_recent.tail(recent_days).copy()
                         # build features same way we do for training
@@ -249,9 +369,6 @@ if LOADED_MODEL is not None:
                                             cur_row[lag_cols_sorted[i]] = cur_row[lag_cols_sorted[i-1]].values
                                         cur_row[lag_cols_sorted[0]] = pred
 
-                                    # for SMA/RSI features we keep them unchanged (approx) for short horizon
-                                    # if stored features include date-like columns, ignore them (we only used numeric features)
-
                                 # Build forecast DataFrame with dates
                                 last_date = df_recent.index[-1]
                                 future_idx = pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=7)  # business days
@@ -270,10 +387,17 @@ if LOADED_MODEL is not None:
 
 # --------- Training pipeline ----------
 if run_button:
-    data = fetch_data(ticker, years)
-    if data.empty:
-        st.error("No data fetched. Check ticker or network.")
+    # validate ticker
+    if not ticker or str(ticker).strip() == "":
+        st.error("Please enter a ticker symbol (or pick one from the dropdown).")
         st.stop()
+
+    uploaded_bytes = csv_upload.read() if csv_upload is not None else None
+    data = fetch_data(ticker, years, uploaded_csv_bytes=uploaded_bytes, show_diagnostics=True)
+    if data.empty:
+        st.error("No data fetched. Check ticker, network, or upload a CSV with Date + Close column.")
+        st.stop()
+
     st.success(f"Fetched {len(data)} rows for {ticker}")
     st.write(data.tail())
 
@@ -281,10 +405,18 @@ if run_button:
     if add_tech:
         df_feat = add_technical_indicators(df_feat)
     df_feat = df_feat.dropna()
+    if df_feat.empty:
+        st.error("No features available after applying lags/technical indicators. Try reducing lag count or increasing years of data.")
+        st.stop()
+
     X = df_feat.drop(columns=['Close'])
     y = df_feat['Close']
 
     split_idx = int(len(X) * train_frac)
+    if split_idx < 1 or split_idx >= len(X):
+        st.error("Train fraction produced an invalid split. Adjust 'Train fraction' or collect more data.")
+        st.stop()
+
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 

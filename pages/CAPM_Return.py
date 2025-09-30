@@ -39,7 +39,7 @@ Compute Beta for multiple stocks vs a market proxy and estimate expected returns
 col1, col2 = st.columns([2, 1])
 with col1:
     stocks_list = st.multiselect(
-        "Choose stocks (1–8)", 
+        "Choose stocks (1–8)",
         options=['TSLA','AAPL','MSFT','NFLX','AMZN','NVDA','GOOGL','SPY'],
         default=['TSLA','AAPL','MSFT','NFLX'],
     )
@@ -54,7 +54,7 @@ with market_col2:
     Rf = float(rf_pct) / 100.0
 
 st.markdown("Optional: upload CSVs (Date + Close or Adj Close). You can upload separate CSV per stock or one market CSV.")
-upload_stock_files = st.file_uploader("Upload individual stock CSVs (multiple allowed)", type="csv", accept_multiple_files=True, help="Each CSV should have Date and Close/Adj Close column. Name does not need to match ticker; uploaded files are matched by asking the user below.")
+upload_stock_files = st.file_uploader("Upload individual stock CSVs (multiple allowed)", type="csv", accept_multiple_files=True, help="Each CSV should have Date and Close/Adj Close column. Name does not need to match ticker; uploaded files are matched by filename (ticker).")
 uploaded_market_csv = st.file_uploader("Upload market CSV (single)", type="csv")
 
 show_diagnostics = st.checkbox("Show diagnostics (detailed errors)", value=False)
@@ -99,14 +99,6 @@ def parse_uploaded_csv_bytes(b):
 
 # multi-source fetch function (returns df, source_name)
 def fetch_symbol(sym, start, end, uploaded_files_map=None):
-    """
-    Attempt fetching symbol in order:
-    - uploaded_files_map: dict mapping symbol->file bytes (prefer these)
-    - yfinance
-    - pandas_datareader->stooq
-    - AlphaVantage (if API key available)
-    Returns (df, source_name) where df has 'Close' column.
-    """
     errors = []
     # 0) uploaded
     if uploaded_files_map and sym in uploaded_files_map:
@@ -196,18 +188,14 @@ def fetch_symbol(sym, start, end, uploaded_files_map=None):
             }
             r = requests.get(url, params=params, timeout=15)
             if r.status_code==200 and r.text:
-                # robust parse
                 try:
                     from io import StringIO
                     df = pd.read_csv(StringIO(r.text))
                 except Exception:
-                    # fallback: try generic parse
                     df = pd.read_csv(io.StringIO(r.text))
                 if df.empty:
                     errors.append(("alphavantage","empty CSV"))
                 else:
-                    # find date col and close/adjusted_close
-                    # prefer adjusted_close then close
                     date_col = None
                     for c in df.columns:
                         if c.lower() in ("timestamp","date","time"):
@@ -255,10 +243,9 @@ if st.button("Compute CAPM"):
         st.error("Please specify at least 1 year.")
         st.stop()
 
-    # prepare uploaded files mapping by asking user to name them optionally
+    # prepare uploaded files mapping by filename (uppercase without extension)
     uploaded_map = {}
     if upload_stock_files:
-        # try to map filenames that equal ticker.csv or user may have uploaded in same order
         for f in upload_stock_files:
             name = os.path.splitext(f.name)[0].upper()
             try:
@@ -310,7 +297,7 @@ if st.button("Compute CAPM"):
                 mdf2, msrc2 = fetch_symbol("SPY", start, end, uploaded_files_map=uploaded_map)
                 if mdf2 is not None and not mdf2.empty:
                     market_df = mdf2.rename(columns={"Close":"market_close"})
-                    market_src = "yfinance:SPY" if msrc2=="yfinance" else msrc2
+                    market_src = "SPY"
                     market_symbol = "SPY"
                 else:
                     st.error("Failed to fetch market data. Upload CSV or check network / API keys.")
@@ -328,70 +315,82 @@ if st.button("Compute CAPM"):
         st.error("After aligning dates, no overlapping data remains between the selected stocks and market. Try expanding years or upload CSVs with matching ranges.")
         st.stop()
 
-    # show small sample
-    st.markdown("### Sample (head)")
-    st.dataframe(combined.head().round(4))
-    st.markdown("### Sample (tail)")
-    st.dataframe(combined.tail().round(4))
+    # -------- Top: two charts side-by-side (Price & Normalized) --------
+    chart_col1, chart_col2 = st.columns([1, 1])
+    with chart_col1:
+        st.subheader("Price of all the Stocks")
+        try:
+            # plot raw prices (interactive_plot expects Date column if given DataFrame)
+            plot_df = combined.reset_index().rename(columns={combined.reset_index().columns[0]:"Date"})
+            st.plotly_chart(capm_functions.interactive_plot(plot_df), use_container_width=True)
+        except Exception:
+            st.error("Failed to render price chart.")
+            if show_diagnostics:
+                st.text(traceback.format_exc())
 
+    with chart_col2:
+        st.subheader("Price of all the Stocks (After Normalizing)")
+        try:
+            plot_df = combined.reset_index().rename(columns={combined.reset_index().columns[0]:"Date"})
+            norm = capm_functions.normalize(plot_df)
+            st.plotly_chart(capm_functions.interactive_plot(norm), use_container_width=True)
+        except Exception:
+            st.error("Failed to render normalized price chart.")
+            if show_diagnostics:
+                st.text(traceback.format_exc())
+
+    # -------- Bottom: two tables side-by-side (Beta & CAPM return) --------
     # compute percent returns per period (capm_functions expects percent)
     returns = combined.copy()
     for col in returns.columns:
         returns[col] = returns[col].pct_change().fillna(0) * 100.0
     returns = returns.rename(columns={"market_close":"sp500"})
 
-    # compute beta for each stock using capm_functions.calculate_beta if available (it expects a DataFrame)
-    results = []
+    # compute beta for each stock using capm_functions.calculate_beta if available
+    beta_list = []
     for s in stocks_list:
         if s not in returns.columns:
-            results.append({"Stock": s, "Beta": None})
+            beta_list.append({"Stock": s, "Beta Value": None})
             continue
         try:
             b, a = capm_functions.calculate_beta(returns.reset_index(drop=True), s)
-            results.append({"Stock": s, "Beta": b})
+            beta_list.append({"Stock": s, "Beta Value": round(float(b), 2)})
         except Exception:
-            # fallback polyfit
             try:
                 slope, inter = np.polyfit(returns["sp500"].values, returns[s].values, 1)
-                results.append({"Stock": s, "Beta": float(slope)})
+                beta_list.append({"Stock": s, "Beta Value": round(float(slope), 2)})
             except Exception:
-                results.append({"Stock": s, "Beta": None})
+                beta_list.append({"Stock": s, "Beta Value": None})
 
-    results_df = pd.DataFrame(results)
-    st.markdown("### Beta estimates")
-    st.dataframe(results_df, use_container_width=True)
+    beta_df = pd.DataFrame(beta_list)
 
-    # expected returns CAPM
+    # expected returns CAPM (annualized)
     periods_per_year = 252.0
     mean_rm = (returns["sp500"].mean() / 100.0) * periods_per_year  # percent->fraction then annualize
     ers = []
-    for row in results:
-        b = row["Beta"]
+    for row in beta_list:
+        b = row["Beta Value"]
         if b is None:
             er = None
         else:
-            er = Rf + b * (mean_rm - Rf)
-        ers.append({"Stock": row["Stock"], "CAPM_Return_annual_%": round(er*100.0, 3) if er is not None else None})
+            er = Rf + (float(b) / 1.0) * (mean_rm - Rf)  # b already numeric
+        ers.append({"Stock": row["Stock"], "Return Value": round(er * 100.0, 2) if er is not None else None})
     ers_df = pd.DataFrame(ers)
-    st.markdown("### CAPM Expected Returns (annualized)")
-    st.dataframe(ers_df, use_container_width=True)
 
-    # plot normalized prices
-    try:
-        plot_df = combined.copy()
-        norm = capm_functions.normalize(plot_df.reset_index().rename(columns={plot_df.reset_index().columns[0]:"Date"}))
-        st.plotly_chart(capm_functions.interactive_plot(norm), use_container_width=True)
-    except Exception:
-        if show_diagnostics:
-            st.text("Plotting traceback:")
-            st.text(traceback.format_exc())
+    # display tables side-by-side
+    table_col1, table_col2 = st.columns([1, 1])
+    with table_col1:
+        st.subheader("Calculated Beta Value")
+        st.dataframe(beta_df, use_container_width=True)
+    with table_col2:
+        st.subheader("Calculated Return using CAPM")
+        st.dataframe(ers_df, use_container_width=True)
 
-    # show data sources summary
+    # final diagnostics / info
     if show_diagnostics:
         st.write("Data sources (per stock):")
         for k, v in stock_sources.items():
             st.write(f"- {k}: {v}")
         st.write(f"Market source: {market_src}")
     else:
-        st.info(f"Data sources: market ← {market_src}; stocks ← multiple (open diagnostics to view).")
-
+        st.info(f"Data sources: market ← {market_src}; stocks ← multiple (enable diagnostics to view per-stock sources).")

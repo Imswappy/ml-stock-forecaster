@@ -104,3 +104,118 @@ def fetch_prices(sym, start, end):
     # Nothing available
     st.error("No data backend available (pandas_datareader nor yfinance).")
     return pd.DataFrame()
+
+# --- Compute Beta on button press ---
+if st.button("Compute Beta"):
+    if ticker == "" or index_symbol == "":
+        st.error("Please enter both a stock ticker and an index symbol.")
+    else:
+        with st.spinner("Fetching data..."):
+            stock_df = fetch_prices(ticker, start, end)
+            idx_df = fetch_prices(index_symbol, start, end)
+
+        if stock_df.empty:
+            st.error(f"Failed to fetch price data for {ticker}. Check symbol or network.")
+            st.stop()
+        if idx_df.empty:
+            st.error(f"Failed to fetch price data for market index {index_symbol}. Check symbol or network.")
+            st.stop()
+
+        # align on dates (inner join)
+        df = stock_df.join(idx_df, how="inner", lsuffix="_stock", rsuffix="_idx")
+        df.columns = ["Close_stock", "Close_idx"]
+
+        if df.empty or len(df) < 10:
+            st.error("Not enough overlapping data between stock and index to compute Beta (need more data).")
+            st.stop()
+
+        # compute returns according to frequency
+        if freq == "daily":
+            ret_stock = df["Close_stock"].pct_change().dropna()
+            ret_idx = df["Close_idx"].pct_change().dropna()
+        elif freq == "weekly":
+            ret_stock = df["Close_stock"].pct_change(periods=5).dropna()
+            ret_idx = df["Close_idx"].pct_change(periods=5).dropna()
+        else:  # monthly
+            ret_stock = df["Close_stock"].pct_change(periods=21).dropna()
+            ret_idx = df["Close_idx"].pct_change(periods=21).dropna()
+
+        # align returns
+        ret_df = pd.concat([ret_stock, ret_idx], axis=1).dropna()
+        ret_df.columns = ["R_i", "R_m"]
+
+        if ret_df.empty:
+            st.error("No overlapping returns after resampling. Try a different frequency or longer history.")
+            st.stop()
+
+        # convert to excess returns using Rf (annual -> period)
+        if freq == "daily":
+            periods_per_year = 252.0
+        elif freq == "weekly":
+            periods_per_year = 52.0
+        else:
+            periods_per_year = 12.0
+
+        period_rf = (1 + Rf) ** (1.0 / periods_per_year) - 1.0
+        ret_df["Ri_ex"] = ret_df["R_i"] - period_rf
+        ret_df["Rm_ex"] = ret_df["R_m"] - period_rf
+
+        # Linear regression for beta
+        X = ret_df["Rm_ex"].values.reshape(-1, 1)
+        y = ret_df["Ri_ex"].values
+        lr = LinearRegression()
+        lr.fit(X, y)
+        beta = float(lr.coef_[0])
+        alpha = float(lr.intercept_)
+
+        # alternative slope via polyfit
+        slope, intercept = np.polyfit(ret_df["Rm_ex"].values, ret_df["Ri_ex"].values, 1)
+
+        st.metric("Estimated Beta (LinearRegression slope)", f"{beta:.4f}")
+        st.write(f"Intercept (alpha): {alpha:.6f}")
+        st.write(f"Slope (polyfit): {slope:.6f} — should be similar to beta above")
+
+        # annualize beta-based expected return via CAPM
+        mean_rm = ret_df["R_m"].mean() * periods_per_year
+        expected_return = Rf + beta * (mean_rm - Rf)
+        st.write("Estimated market mean return (annualized):", f"{mean_rm:.3%}")
+        st.write("CAPM expected return (annualized):", f"{expected_return:.3%}")
+
+        # Interpretation
+        st.markdown("**Beta interpretation:**")
+        if beta > 1.0:
+            st.info("β > 1 : stock is more volatile than the market.")
+        elif beta < 1.0:
+            st.info("β < 1 : stock is less volatile than the market.")
+        else:
+            st.info("β = 1 : stock moves in line with the market.")
+
+        # Plot scatter + regression line
+        if show_plot:
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.scatter(ret_df["Rm_ex"], ret_df["Ri_ex"], alpha=0.6, label="observations")
+            xs = np.linspace(ret_df["Rm_ex"].min(), ret_df["Rm_ex"].max(), 100)
+            ys = slope * xs + intercept
+            ax.plot(xs, ys, color="red", label=f"fit: slope={slope:.3f}")
+            ax.set_xlabel("Market excess return")
+            ax.set_ylabel("Stock excess return")
+            ax.set_title(f"{ticker} vs {index_symbol} — Beta regression")
+            ax.legend()
+            st.pyplot(fig)
+
+        st.subheader("Sample of returns used")
+        st.dataframe(
+            ret_df.tail(50)
+            .assign(Ri=lambda d: d["R_i"].round(5), Rm=lambda d: d["R_m"].round(5))[["Ri", "Rm"]]
+        )
+
+# If neither backend available
+if not HAVE_YF:
+    st.error(
+        "No price-fetch backend available. Install `yfinance` in your environment.\n\n"
+        "Quick fix (shell):\n"
+        "  pip install yfinance\n\n"
+        "Then restart the Streamlit app."
+    )

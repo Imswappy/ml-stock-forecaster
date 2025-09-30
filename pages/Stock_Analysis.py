@@ -104,12 +104,12 @@ def parse_uploaded_csv_bytes(b: bytes) -> pd.DataFrame:
 # -----------------------------
 # Twelve Data fetch helper
 # -----------------------------
+# Diagnostic Twelve Data fetch + robust fetch_history — paste in pages/Stock_Analysis.py
 def fetch_from_twelvedata(symbol: str, start_dt: str, end_dt: str, show_diag: bool = False) -> pd.DataFrame:
     """
-    Use Twelve Data time_series endpoint. Returns DataFrame with index datetime and columns:
-    ['Close','Open','High','Low','Volume'] when available.
+    Diagnostic Twelve Data fetch. Returns DataFrame or empty.
+    Shows diagnostics in Streamlit when show_diag True.
     """
-    # read key from Streamlit secrets or env var
     td_key = None
     try:
         td_key = st.secrets.get("TWELVEDATA_API_KEY")
@@ -120,7 +120,7 @@ def fetch_from_twelvedata(symbol: str, start_dt: str, end_dt: str, show_diag: bo
 
     if not td_key:
         if show_diag:
-            st.info("No TWELVEDATA key available (set TWELVEDATA_API_KEY in secrets or environment).")
+            st.warning("No TWELVEDATA_API_KEY found in secrets or environment.")
         return pd.DataFrame()
 
     url = "https://api.twelvedata.com/time_series"
@@ -129,94 +129,96 @@ def fetch_from_twelvedata(symbol: str, start_dt: str, end_dt: str, show_diag: bo
         "interval": "1day",
         "start_date": start_dt,
         "end_date": end_dt,
-        "outputsize": 5000,  # large enough to cover long ranges
+        "outputsize": 5000,
         "format": "JSON",
         "apikey": td_key,
     }
 
     try:
-        r = requests.get(url, params=params, timeout=15)
-        if r.status_code != 200:
-            if show_diag:
-                st.warning(f"Twelve Data HTTP {r.status_code}: {r.text[:200]}")
-            return pd.DataFrame()
-        j = r.json()
-        # check status / errors
-        if j.get("status") == "error" or "values" not in j:
-            if show_diag:
-                st.warning(f"Twelve Data response error: {j.get('message') or j}")
-            return pd.DataFrame()
-
-        vals = j.get("values", [])
-        if not vals:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(vals)
-        # Twelve Data returns strings: datetime, open, high, low, close, volume
-        # ensure columns exist and convert to numeric
-        col_map = {}
-        if "datetime" in df.columns:
-            df = df.rename(columns={"datetime": "datetime"})
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            df = df.set_index("datetime").sort_index()
-        else:
-            # sometimes 'date' exists (defensive)
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"])
-                df = df.set_index("date").sort_index()
-
-        # standardize numeric columns
-        numeric_cols = {}
-        for c in df.columns:
-            lc = c.lower()
-            if lc in ("close", "close"):
-                numeric_cols[c] = "Close"
-            elif lc in ("open",):
-                numeric_cols[c] = "Open"
-            elif lc in ("high",):
-                numeric_cols[c] = "High"
-            elif lc in ("low",):
-                numeric_cols[c] = "Low"
-            elif lc in ("volume",):
-                numeric_cols[c] = "Volume"
-
-        df = df.rename(columns=numeric_cols)
-        for c in numeric_cols.values():
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-        # keep preferred columns in standard order
-        keep = [c for c in ["Close", "Open", "High", "Low", "Volume"] if c in df.columns]
-        out = df[keep].dropna()
-        return out
+        r = requests.get(url, params=params, timeout=20)
     except Exception as e:
         if show_diag:
-            st.warning(f"Twelve Data fetch exception: {e}")
+            st.error(f"Twelve Data request exception: {e}")
         return pd.DataFrame()
 
+    if show_diag:
+        st.write(f"Twelve Data HTTP {r.status_code} for {symbol}")
+        # show small portion of response for debugging but avoid huge dumps
+        txt = r.text
+        st.code(txt[:1000] + ("... (truncated)" if len(txt) > 1000 else ""))
 
-# -----------------------------
-# Price history (robust fallback)
-# -----------------------------
+    try:
+        j = r.json()
+    except Exception as e:
+        if show_diag:
+            st.error(f"Failed to parse JSON from Twelve Data: {e}")
+        return pd.DataFrame()
+
+    # Common failure cases
+    if isinstance(j, dict) and (j.get("status") == "error" or "message" in j):
+        if show_diag:
+            st.error(f"Twelve Data error: {j.get('message') or j}")
+        return pd.DataFrame()
+
+    values = j.get("values") if isinstance(j, dict) else None
+    if not values:
+        if show_diag:
+            st.warning("Twelve Data returned no 'values' field or empty list.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(values)
+    # unify index
+    if "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.set_index("datetime").sort_index()
+    elif "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+    # map numeric columns
+    col_map = {}
+    for c in df.columns:
+        lc = c.lower()
+        if lc in ("close",):
+            col_map[c] = "Close"
+        elif lc in ("open",):
+            col_map[c] = "Open"
+        elif lc in ("high",):
+            col_map[c] = "High"
+        elif lc in ("low",):
+            col_map[c] = "Low"
+        elif lc in ("volume",):
+            col_map[c] = "Volume"
+    df = df.rename(columns=col_map)
+    for col in ["Close", "Open", "High", "Low", "Volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    keep = [c for c in ["Close", "Open", "High", "Low", "Volume"] if c in df.columns]
+    out = df[keep].dropna()
+    if show_diag:
+        st.success(f"Twelve Data returned {len(out)} rows for {symbol}")
+    return out
+
 @st.cache_data(ttl=3600)
 def fetch_history(ticker_sym: str, start_dt: str, end_dt: str, uploaded_bytes: Optional[bytes]) -> pd.DataFrame:
     """
-    Order:
-      1) uploaded CSV
-      2) yfinance.download / history
-      3) Twelve Data (requires TWELVEDATA_API_KEY)
+    Diagnostic fetch_history with explicit diagnostics (uploaded CSV -> yfinance -> Twelve Data).
     """
     # 1) uploaded CSV
     if uploaded_bytes:
         parsed = parse_uploaded_csv_bytes(uploaded_bytes)
         if not parsed.empty:
+            if show_diagnostics:
+                st.success("Using uploaded CSV (parsed).")
             return parsed
+        else:
+            if show_diagnostics:
+                st.warning("Uploaded CSV present but parsing produced empty DataFrame.")
 
-    # 2) yfinance (best-effort)
+    # 2) yfinance
     if HAVE_YF:
         try:
             df = yf.download(ticker_sym, start=start_dt, end=end_dt, progress=False)
             if df is None or df.empty:
-                # try history fallback
                 t = yf.Ticker(ticker_sym)
                 df = t.history(start=start_dt, end=end_dt, actions=False)
             if df is not None and not df.empty:
@@ -225,10 +227,18 @@ def fetch_history(ticker_sym: str, start_dt: str, end_dt: str, uploaded_bytes: O
                 cols = [c for c in ["Close", "Open", "High", "Low", "Volume"] if c in df.columns]
                 out = df[cols].dropna()
                 if not out.empty:
+                    if show_diagnostics:
+                        st.success(f"yfinance returned {len(out)} rows for {ticker_sym}")
                     return out
-        except Exception:
-            # swallow: fallback to TwelveData
-            pass
+                else:
+                    if show_diagnostics:
+                        st.warning("yfinance returned rows but after selecting columns & dropping NA the result is empty.")
+            else:
+                if show_diagnostics:
+                    st.warning("yfinance returned no data (empty).")
+        except Exception as e:
+            if show_diagnostics:
+                st.error(f"yfinance exception: {e}")
 
     # 3) Twelve Data fallback
     td_df = fetch_from_twelvedata(ticker_sym, start_dt, end_dt, show_diag=show_diagnostics)
@@ -236,7 +246,10 @@ def fetch_history(ticker_sym: str, start_dt: str, end_dt: str, uploaded_bytes: O
         return td_df
 
     # nothing worked
+    if show_diagnostics:
+        st.error("All data sources failed (uploaded / yfinance / Twelve Data).")
     return pd.DataFrame()
+
 
 
 # -----------------------------

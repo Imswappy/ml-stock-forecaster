@@ -1,5 +1,6 @@
 # pages/CAPM_Return.py
 import datetime
+import importlib
 import io
 import os
 import traceback
@@ -8,7 +9,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# use yfinance when available; fallback behavior if not installed
+# try yfinance
 try:
     import yfinance as yf
     HAVE_YF = True
@@ -18,71 +19,56 @@ except Exception:
 
 from pages.utils import capm_functions
 
-st.set_page_config(
-    page_title="Calculate CAPM Return",
-    page_icon="chart_with_upwards_trend",
-    layout="wide",
-)
+st.set_page_config(page_title="CAPM Return (multi-stock)", page_icon="📊", layout="wide")
+st.title("CAPM Return — Multi-stock CAPM")
 
-st.title("Capital Asset Pricing Model — Multi-stock Return 📈")
 st.markdown(
     """
-Select stocks and a history window; the app computes beta for each stock vs the market and
-estimates expected return using CAPM: \\(E[R_i] = R_f + \\beta_i (E[R_m] - R_f)\\).
+Compute Beta for multiple stocks vs a market proxy and estimate expected returns by CAPM.
 
-Notes:
-- By default the market proxy used is **SPY** (ETF) for robust availability; you may change it below.
-- If network fetch fails you can upload CSVs (Date + Close/Adj Close) for stocks and/or market.
+**Behavior**
+- Data sources tried (per symbol): uploaded CSV → yfinance → pandas_datareader (stooq) → Alpha Vantage (if key present).
+- Set `ALPHAVANTAGE_API_KEY` in Streamlit secrets or as an environment variable to enable AlphaVantage fallback.
+- Use "Show diagnostics" to reveal detailed fetch errors/traces.
 """
 )
 
-# ----------------------------
-# Inputs
-# ----------------------------
-col1, col2 = st.columns([1.5, 1])
+# -------------------------
+# UI inputs
+# -------------------------
+col1, col2 = st.columns([2, 1])
 with col1:
     stocks_list = st.multiselect(
-        "Choose stocks (pick up to 8)", 
-        options=['TSLA', 'AAPL','NFLX','MGM','MSFT','AMZN','NVDA','GOOGL'],
-        default=['TSLA', 'AAPL','MSFT','NFLX'],
-        help="Choose one or more stocks to compute CAPM returns for."
+        "Choose stocks (1–8)", 
+        options=['TSLA','AAPL','MSFT','NFLX','AMZN','NVDA','GOOGL','SPY'],
+        default=['TSLA','AAPL','MSFT','NFLX'],
     )
 with col2:
-    years = st.number_input("Number of Years", min_value=1, max_value=10, value=3, help="Historical window length (years)")
+    years = st.number_input("Years of history", min_value=1, max_value=10, value=3)
 
 market_col1, market_col2 = st.columns([1, 1])
 with market_col1:
-    market_symbol = st.text_input("Market proxy symbol (ETF or Index)", value="SPY", help="Use SPY (ETF) by default. If you want to use S&P500 index ticker (e.g. ^GSPC) note some hosts may block index scraping.")
+    market_symbol = st.text_input("Market proxy symbol", value="SPY")
 with market_col2:
-    rf_pct = st.number_input("Risk-free rate (annual %, default 0)", value=0.0, step=0.01)
+    rf_pct = st.number_input("Risk-free rate (annual %)", value=0.0, step=0.01)
     Rf = float(rf_pct) / 100.0
 
-st.markdown("**Optional:** upload CSVs (Date + Close/Adj Close) to avoid network fetch problems.")
-upload_col1, upload_col2 = st.columns(2)
-with upload_col1:
-    uploaded_stocks_zip = st.file_uploader("Upload a single CSV with all stocks (Date + Close columns named by ticker) OR individual stock CSVs zipped (not required)", type=["csv"], help="If you upload a single CSV it should contain Date and one column per ticker named exactly as the tickers selected.")
-with upload_col2:
-    uploaded_market_csv = st.file_uploader("Upload market CSV (Date + Close/Adj Close)", type=["csv"])
+st.markdown("Optional: upload CSVs (Date + Close or Adj Close). You can upload separate CSV per stock or one market CSV.")
+upload_stock_files = st.file_uploader("Upload individual stock CSVs (multiple allowed)", type="csv", accept_multiple_files=True, help="Each CSV should have Date and Close/Adj Close column. Name does not need to match ticker; uploaded files are matched by asking the user below.")
+uploaded_market_csv = st.file_uploader("Upload market CSV (single)", type="csv")
 
-# Diagnostics toggle
-show_diagnostics = st.checkbox("Show diagnostics (detailed fetch errors)", value=False)
+show_diagnostics = st.checkbox("Show diagnostics (detailed errors)", value=False)
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def parse_price_csv_bytes(bytes_io):
-    """
-    Parse CSV bytes, try to detect date column and close/adj close.
-    Return DataFrame with index as datetime and single 'Close' column (or empty DF on failure).
-    """
+# helper: parse uploaded CSV (single file)
+def parse_uploaded_csv_bytes(b):
     try:
-        df = pd.read_csv(io.BytesIO(bytes_io))
+        df = pd.read_csv(io.BytesIO(b))
     except Exception:
         try:
-            df = pd.read_csv(io.StringIO(bytes_io.decode()))
+            df = pd.read_csv(io.StringIO(b.decode()))
         except Exception:
             return pd.DataFrame()
-    # find date-like column
+    # find date col
     date_col = None
     for c in df.columns:
         if c.lower() in ("date", "timestamp", "time"):
@@ -91,14 +77,14 @@ def parse_price_csv_bytes(bytes_io):
     if date_col is None:
         date_col = df.columns[0]
     try:
-        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     except Exception:
         return pd.DataFrame()
     df = df.set_index(date_col).sort_index()
-    # find close column
+    # find close col
     close_col = None
     for c in df.columns:
-        if c.lower() in ("adj close", "adjusted_close", "adjusted close", "adjusted_close"):
+        if c.lower() in ("adj close","adjusted_close","adjusted close","adjusted_close"):
             close_col = c
             break
     if close_col is None:
@@ -108,223 +94,304 @@ def parse_price_csv_bytes(bytes_io):
                 break
     if close_col is None:
         return pd.DataFrame()
-    return df[[close_col]].rename(columns={close_col: "Close"})
+    out = df[[close_col]].rename(columns={close_col: "Close"})
+    return out
 
-def fetch_prices_yf(sym, years):
-    """Fetch using yfinance (simple). Returns df or empty df and error message."""
-    if not HAVE_YF:
-        return pd.DataFrame(), "yfinance not installed"
-    try:
-        df = yf.download(sym, period=f"{years}y", progress=False)
-        if df is None or df.empty:
-            return pd.DataFrame(), "yfinance returned empty data"
-        # prefer Adj Close
-        if "Adj Close" in df.columns:
-            out = df[["Adj Close"]].rename(columns={"Adj Close":"Close"})
-        else:
-            out = df[["Close"]]
-        return out, None
-    except Exception as e:
-        return pd.DataFrame(), f"yfinance error: {e}"
-
-# ----------------------------
-# Validation & Compute
-# ----------------------------
-if st.button("Compute CAPM returns"):
-    # basic validation
-    if not stocks_list:
-        st.error("Please select at least one stock to analyze.")
-        st.stop()
-    if years < 1:
-        st.error("Please choose at least 1 year of history.")
-        st.stop()
-
-    start_date = (datetime.date.today() - datetime.timedelta(days=365*years)).isoformat()
-    end_date = datetime.date.today().isoformat()
-
-    # 1) Try to construct stocks_df from uploaded CSV (if provided)
-    stocks_df = pd.DataFrame()
-    source_stocks = None
-    if uploaded_stocks_zip is not None:
-        # If user uploaded a CSV with Date + columns for tickers, try to use it
+# multi-source fetch function (returns df, source_name)
+def fetch_symbol(sym, start, end, uploaded_files_map=None):
+    """
+    Attempt fetching symbol in order:
+    - uploaded_files_map: dict mapping symbol->file bytes (prefer these)
+    - yfinance
+    - pandas_datareader->stooq
+    - AlphaVantage (if API key available)
+    Returns (df, source_name) where df has 'Close' column.
+    """
+    errors = []
+    # 0) uploaded
+    if uploaded_files_map and sym in uploaded_files_map:
         try:
-            uploaded_bytes = uploaded_stocks_zip.read()
-            candidate = parse_price_csv_bytes(uploaded_bytes)
-            if not candidate.empty:
-                # If file contains multiple columns (named tickers), use them
-                # candidate has single Close column — so assume this was individual file -> skip
-                # Instead try reading the CSV again and keep all columns except Date
-                df_all = pd.read_csv(io.BytesIO(uploaded_bytes))
-                date_col = next((c for c in df_all.columns if c.lower() in ("date","timestamp","time")), df_all.columns[0])
-                df_all[date_col] = pd.to_datetime(df_all[date_col], errors='coerce')
-                df_all = df_all.set_index(date_col).sort_index()
-                # ensure we have requested tickers as columns
-                missing = [t for t in stocks_list if t not in df_all.columns]
-                if not missing:
-                    stocks_df = df_all[stocks_list].rename(columns=lambda c: c)
-                    stocks_df.index = pd.to_datetime(stocks_df.index)
-                    source_stocks = "uploaded_csv_multi"
-                else:
-                    # fallback: maybe it's a single-ticker CSV (handled below)
-                    pass
-        except Exception:
+            df = parse_uploaded_csv_bytes(uploaded_files_map[sym])
+            if not df.empty:
+                return df, "uploaded_csv"
+        except Exception as e:
+            errors.append(("uploaded", str(e)))
             if show_diagnostics:
-                st.text("Uploaded stocks CSV parse traceback:")
                 st.text(traceback.format_exc())
 
-    # 2) If not constructed, fetch each stock from yfinance
-    if stocks_df.empty:
-        tmp = {}
-        any_fail = False
-        for t in stocks_list:
-            df_t, err = fetch_prices_yf(t, years)
-            if df_t is None or df_t.empty:
-                any_fail = True
-                if show_diagnostics:
-                    st.warning(f"Failed to fetch {t} via yfinance: {err}")
+    # 1) yfinance
+    try:
+        if HAVE_YF:
+            df = yf.download(sym, start=start, end=end, progress=False)
+            if df is not None and not df.empty:
+                if "Adj Close" in df.columns:
+                    out = df[["Adj Close"]].rename(columns={"Adj Close":"Close"})
+                else:
+                    out = df[["Close"]]
+                return out, "yfinance"
             else:
-                tmp[t] = df_t["Close"]
-        if tmp:
-            stocks_df = pd.DataFrame(tmp).sort_index()
-            source_stocks = "yfinance"
+                errors.append(("yfinance", "empty"))
         else:
-            st.error("Failed to fetch any stock prices via yfinance. Try uploading CSVs or check network.")
-            st.stop()
+            errors.append(("yfinance", "not installed"))
+    except Exception as e:
+        errors.append(("yfinance", str(e)))
+        if show_diagnostics:
+            st.write(f"yfinance error for {sym}:")
+            st.text(traceback.format_exc())
 
-    # 3) Market prices: prefer uploaded market CSV, else fetch market_symbol via yfinance
+    # 2) pandas_datareader -> stooq
+    try:
+        pdr_spec = importlib.util.find_spec("pandas_datareader")
+        if pdr_spec is not None:
+            try:
+                from pandas_datareader import data as pdr
+                df = pdr.DataReader(sym, "stooq", start, end)
+                if df is not None and not df.empty:
+                    df = df.sort_index()
+                    if "Close" in df.columns:
+                        out = df[["Close"]]
+                    else:
+                        col = [c for c in df.columns if c.lower()=="close"]
+                        if col:
+                            out = df[[col[0]]].rename(columns={col[0]:"Close"})
+                        else:
+                            out = pd.DataFrame()
+                    if not out.empty:
+                        return out, "pandas_datareader(stooq)"
+                    else:
+                        errors.append(("pdr-stooq", "no Close col"))
+                else:
+                    errors.append(("pdr-stooq", "empty"))
+            except Exception as e:
+                errors.append(("pdr-stooq", str(e)))
+                if show_diagnostics:
+                    st.write(f"pandas_datareader(stooq) error for {sym}:")
+                    st.text(traceback.format_exc())
+        else:
+            errors.append(("pandas_datareader", "not installed"))
+    except Exception as e:
+        errors.append(("pdr-probe", str(e)))
+        if show_diagnostics:
+            st.text(traceback.format_exc())
+
+    # 3) Alpha Vantage (CSV mode) if key present in secrets or env
+    av_key = None
+    try:
+        av_key = st.secrets.get("ALPHAVANTAGE_API_KEY") if hasattr(st, "secrets") else None
+    except Exception:
+        av_key = None
+    if not av_key:
+        av_key = os.environ.get("ALPHAVANTAGE_API_KEY")
+
+    if av_key:
+        try:
+            import requests
+            url = "https://www.alphavantage.co/query"
+            params = {
+                "function":"TIME_SERIES_DAILY_ADJUSTED",
+                "symbol": sym,
+                "outputsize":"full",
+                "apikey": av_key,
+                "datatype":"csv"
+            }
+            r = requests.get(url, params=params, timeout=15)
+            if r.status_code==200 and r.text:
+                # robust parse
+                try:
+                    from io import StringIO
+                    df = pd.read_csv(StringIO(r.text))
+                except Exception:
+                    # fallback: try generic parse
+                    df = pd.read_csv(io.StringIO(r.text))
+                if df.empty:
+                    errors.append(("alphavantage","empty CSV"))
+                else:
+                    # find date col and close/adjusted_close
+                    # prefer adjusted_close then close
+                    date_col = None
+                    for c in df.columns:
+                        if c.lower() in ("timestamp","date","time"):
+                            date_col = c
+                            break
+                    if date_col is None:
+                        date_col = df.columns[0]
+                    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                    df = df.set_index(date_col).sort_index()
+                    if "adjusted_close" in [c.lower() for c in df.columns]:
+                        col = next(c for c in df.columns if c.lower()=="adjusted_close")
+                        out = df[[col]].rename(columns={col:"Close"})
+                        return out, "alphavantage"
+                    elif "close" in [c.lower() for c in df.columns]:
+                        col = next(c for c in df.columns if c.lower()=="close")
+                        out = df[[col]].rename(columns={col:"Close"})
+                        return out, "alphavantage"
+                    else:
+                        errors.append(("alphavantage","no close col"))
+            else:
+                errors.append(("alphavantage", f"HTTP {r.status_code}"))
+        except Exception as e:
+            errors.append(("alphavantage", str(e)))
+            if show_diagnostics:
+                st.write(f"AlphaVantage error for {sym}:")
+                st.text(traceback.format_exc())
+    else:
+        errors.append(("alphavantage","no API key"))
+
+    # All failed
+    if show_diagnostics:
+        st.error(f"All sources failed for {sym}. Details:")
+        for s, m in errors:
+            st.write(f"- {s}: {m}")
+    return pd.DataFrame(), None
+
+# -------------------------
+# Main compute flow
+# -------------------------
+if st.button("Compute CAPM"):
+    if not stocks_list:
+        st.error("Please select at least one stock.")
+        st.stop()
+    if years < 1:
+        st.error("Please specify at least 1 year.")
+        st.stop()
+
+    # prepare uploaded files mapping by asking user to name them optionally
+    uploaded_map = {}
+    if upload_stock_files:
+        # try to map filenames that equal ticker.csv or user may have uploaded in same order
+        for f in upload_stock_files:
+            name = os.path.splitext(f.name)[0].upper()
+            try:
+                uploaded_map[name] = f.read()
+            except Exception:
+                if show_diagnostics:
+                    st.text(f"Failed reading uploaded file {f.name}")
+                    st.text(traceback.format_exc())
+
+    end = datetime.date.today().isoformat()
+    start = (datetime.date.today() - datetime.timedelta(days=365*years)).isoformat()
+
+    # fetch each stock
+    stock_series = {}
+    stock_sources = {}
+    for t in stocks_list:
+        df, src = fetch_symbol(t, start, end, uploaded_files_map=uploaded_map)
+        if df is None or df.empty:
+            if show_diagnostics:
+                st.warning(f"{t}: no data found (source tried: {src})")
+        else:
+            stock_series[t] = df["Close"]
+            stock_sources[t] = src
+
+    if not stock_series:
+        st.error("Failed to fetch any stock prices via available data sources. Try uploading CSVs or check network / AlphaVantage key.")
+        st.stop()
+
+    # market series
     market_df = pd.DataFrame()
-    source_market = None
+    market_src = None
     if uploaded_market_csv is not None:
         try:
-            uploaded_bytes = uploaded_market_csv.read()
-            mdf = parse_price_csv_bytes(uploaded_bytes)
+            b = uploaded_market_csv.read()
+            mdf = parse_uploaded_csv_bytes(b)
             if not mdf.empty:
                 market_df = mdf.rename(columns={"Close":"market_close"})
-                source_market = "uploaded_market_csv"
+                market_src = "uploaded_market_csv"
         except Exception:
             if show_diagnostics:
                 st.text("Uploaded market CSV parse traceback:")
                 st.text(traceback.format_exc())
 
     if market_df.empty:
-        mdf, merr = fetch_prices_yf(market_symbol, years)
+        mdf, msrc = fetch_symbol(market_symbol, start, end, uploaded_files_map=uploaded_map)
         if mdf is None or mdf.empty:
-            # try SPY fallback if requested market failed
+            # try SPY fallback
             if market_symbol.upper() not in ("SPY",):
-                if show_diagnostics:
-                    st.warning(f"Market fetch for {market_symbol} failed ({merr}). Trying SPY as fallback.")
-                mdf2, merr2 = fetch_prices_yf("SPY", years)
+                mdf2, msrc2 = fetch_symbol("SPY", start, end, uploaded_files_map=uploaded_map)
                 if mdf2 is not None and not mdf2.empty:
                     market_df = mdf2.rename(columns={"Close":"market_close"})
-                    source_market = "yfinance:SPY"
+                    market_src = "yfinance:SPY" if msrc2=="yfinance" else msrc2
                     market_symbol = "SPY"
                 else:
-                    st.error("Failed to fetch market data (both requested market and SPY). Upload CSV or check network.")
+                    st.error("Failed to fetch market data. Upload CSV or check network / API keys.")
                     st.stop()
             else:
-                st.error("Failed to fetch market data for SPY. Upload CSV or check network.")
+                st.error("Failed to fetch SPY. Upload CSV or check network / API keys.")
                 st.stop()
         else:
             market_df = mdf.rename(columns={"Close":"market_close"})
-            source_market = f"yfinance:{market_symbol}"
+            market_src = msrc
 
-    # Merge stocks and market on dates
-    # ensure datetime index and alignment
-    stocks_df.index = pd.to_datetime(stocks_df.index)
-    market_df.index = pd.to_datetime(market_df.index)
-    combined = stocks_df.join(market_df, how="inner")
+    # combine into DataFrame
+    combined = pd.DataFrame(stock_series).join(market_df, how="inner")
     if combined.empty:
-        st.error("After aligning dates, no overlapping data remains between stocks and market. Try expanding years or upload CSVs with matching date ranges.")
+        st.error("After aligning dates, no overlapping data remains between the selected stocks and market. Try expanding years or upload CSVs with matching ranges.")
         st.stop()
 
-    # show dataframes head/tail
-    colh1, colh2 = st.columns([1,1])
-    with colh1:
-        st.markdown("### Sample data (head)")
-        st.dataframe(combined.head().round(4))
-    with colh2:
-        st.markdown("### Sample data (tail)")
-        st.dataframe(combined.tail().round(4))
+    # show small sample
+    st.markdown("### Sample (head)")
+    st.dataframe(combined.head().round(4))
+    st.markdown("### Sample (tail)")
+    st.dataframe(combined.tail().round(4))
 
-    # compute daily returns (percentage) similar to your capm_functions.daily_return
-    stocks_daily_return = combined.copy()
-    # We'll compute pct change *as fractions* (not percent), to match math in capm_functions (which uses percent),
-    # but we can adapt: capm_functions expects percent values (it multiplies by 100). To reuse existing functions,
-    # create a DataFrame with percent returns.
-    ret_df = stocks_daily_return.copy()
-    for col in ret_df.columns:
-        ret_df[col] = ret_df[col].pct_change().fillna(0) * 100.0  # percent
+    # compute percent returns per period (capm_functions expects percent)
+    returns = combined.copy()
+    for col in returns.columns:
+        returns[col] = returns[col].pct_change().fillna(0) * 100.0
+    returns = returns.rename(columns={"market_close":"sp500"})
 
-    # rename market column to 'sp500' to reuse capm_functions.calculate_beta and later code
-    # choose 'sp500' label because capm_functions expects that
-    ret_df = ret_df.rename(columns={"market_close": "sp500"})
-
-    # compute beta & alpha for all selected stocks
-    beta = {}
-    alpha = {}
-    for col in stocks_list:
-        if col in ret_df.columns:
-            try:
-                b, a = capm_functions.calculate_beta(ret_df.reset_index(drop=True), col)
-                beta[col] = b
-                alpha[col] = a
-            except Exception:
-                # fallback: compute linear regression slope directly (robust)
-                try:
-                    x = ret_df["sp500"].values
-                    y = ret_df[col].values
-                    slope, inter = np.polyfit(x, y, 1)
-                    beta[col] = slope
-                    alpha[col] = inter
-                except Exception:
-                    beta[col] = float("nan")
-                    alpha[col] = float("nan")
-
-    # Present results
-    beta_df = pd.DataFrame({
-        "Stock": list(beta.keys()),
-        "Beta Value": [round(v, 4) if not np.isnan(v) else None for v in beta.values()]
-    })
-
-    st.markdown("### Calculated Beta values")
-    st.dataframe(beta_df, use_container_width=True)
-
-    # compute expected returns via CAPM (annualized)
-    # first compute market mean return (note: ret_df 'sp500' is percent per period)
-    if freq := "daily":
-        periods_per_year = 252.0
-    rm = (ret_df["sp500"].mean() / 100.0) * periods_per_year  # convert percent -> fraction then annualize
-
-    return_rows = []
-    for stock_name, b in beta.items():
-        if b is None or (isinstance(b, float) and np.isnan(b)):
-            expected = None
-        else:
-            expected = Rf + b * (rm - Rf)
-        return_rows.append({"Stock": stock_name, "CAPM Return (annual %)": round(expected * 100.0, 3) if expected is not None else None})
-
-    return_df = pd.DataFrame(return_rows)
-    st.markdown("### CAPM Expected Returns (annualized)")
-    st.dataframe(return_df, use_container_width=True)
-
-    # show a simple price chart and normalized chart using your util
-    col_chart1, col_chart2 = st.columns([1, 1])
-    with col_chart1:
-        st.markdown("### Price of selected stocks")
-        st.plotly_chart(capm_functions.interactive_plot(combined.reset_index().rename(columns={combined.reset_index().columns[0]:"Date"})), use_container_width=True)
-    with col_chart2:
-        st.markdown("### Normalized prices (start = 1)")
+    # compute beta for each stock using capm_functions.calculate_beta if available (it expects a DataFrame)
+    results = []
+    for s in stocks_list:
+        if s not in returns.columns:
+            results.append({"Stock": s, "Beta": None})
+            continue
         try:
-            normalized = capm_functions.normalize(combined.reset_index().rename(columns={combined.reset_index().columns[0]:"Date"}))
-            st.plotly_chart(capm_functions.interactive_plot(normalized), use_container_width=True)
+            b, a = capm_functions.calculate_beta(returns.reset_index(drop=True), s)
+            results.append({"Stock": s, "Beta": b})
         except Exception:
-            if show_diagnostics:
-                st.text("Normalization plotting traceback:")
-                st.text(traceback.format_exc())
+            # fallback polyfit
+            try:
+                slope, inter = np.polyfit(returns["sp500"].values, returns[s].values, 1)
+                results.append({"Stock": s, "Beta": float(slope)})
+            except Exception:
+                results.append({"Stock": s, "Beta": None})
 
-    # final diagnostics / info
+    results_df = pd.DataFrame(results)
+    st.markdown("### Beta estimates")
+    st.dataframe(results_df, use_container_width=True)
+
+    # expected returns CAPM
+    periods_per_year = 252.0
+    mean_rm = (returns["sp500"].mean() / 100.0) * periods_per_year  # percent->fraction then annualize
+    ers = []
+    for row in results:
+        b = row["Beta"]
+        if b is None:
+            er = None
+        else:
+            er = Rf + b * (mean_rm - Rf)
+        ers.append({"Stock": row["Stock"], "CAPM_Return_annual_%": round(er*100.0, 3) if er is not None else None})
+    ers_df = pd.DataFrame(ers)
+    st.markdown("### CAPM Expected Returns (annualized)")
+    st.dataframe(ers_df, use_container_width=True)
+
+    # plot normalized prices
+    try:
+        plot_df = combined.copy()
+        norm = capm_functions.normalize(plot_df.reset_index().rename(columns={plot_df.reset_index().columns[0]:"Date"}))
+        st.plotly_chart(capm_functions.interactive_plot(norm), use_container_width=True)
+    except Exception:
+        if show_diagnostics:
+            st.text("Plotting traceback:")
+            st.text(traceback.format_exc())
+
+    # show data sources summary
     if show_diagnostics:
-        st.write(f"Data sources used: stocks ← {source_stocks}, market ← {source_market}")
+        st.write("Data sources (per stock):")
+        for k, v in stock_sources.items():
+            st.write(f"- {k}: {v}")
+        st.write(f"Market source: {market_src}")
     else:
-        st.info(f"Data sources used: stocks ← {source_stocks}, market ← {source_market}")
+        st.info(f"Data sources: market ← {market_src}; stocks ← multiple (open diagnostics to view).")
 

@@ -33,13 +33,17 @@ today = datetime.date.today()
 with col1:
     ticker = st.text_input("Stock Ticker", "AAPL").strip().upper()
 with col2:
-    start_date = st.date_input("Start Date", datetime.date(today.year - 1, today.month, today.day))
+    start_date = st.date_input(
+        "Start Date", datetime.date(today.year - 1, today.month, today.day)
+    )
 with col3:
     end_date = st.date_input("End Date", datetime.date(today.year, today.month, today.day))
 
-uploaded_csv = st.file_uploader("Optional: Upload CSV (Date + Close or Adj Close)", type=["csv"])
+uploaded_csv = st.file_uploader(
+    "Optional: Upload CSV (Date + Close or Adj Close)", type=["csv"]
+)
 
-# Helper: parse CSV
+# --- CSV Helper
 def parse_uploaded_csv_bytes(b):
     try:
         df = pd.read_csv(io.BytesIO(b))
@@ -77,7 +81,7 @@ def parse_uploaded_csv_bytes(b):
             out_cols.append(k)
     return df[out_cols].rename(columns={close_col: "Close"})
 
-# Fallback price fetcher
+# --- Price fetcher
 @st.cache_data(ttl=3600)
 def fetch_history(ticker_sym, start_dt, end_dt, uploaded_bytes=None):
     # 1. Uploaded CSV
@@ -93,13 +97,19 @@ def fetch_history(ticker_sym, start_dt, end_dt, uploaded_bytes=None):
             if df is not None and not df.empty:
                 if "Adj Close" in df.columns and "Close" not in df.columns:
                     df = df.rename(columns={"Adj Close": "Close"})
-                cols = [c for c in ["Close", "Open", "High", "Low", "Volume"] if c in df.columns]
+                cols = [
+                    c for c in ["Close", "Open", "High", "Low", "Volume"] if c in df.columns
+                ]
                 return df[cols].dropna()
         except Exception:
             pass
 
     # 3. Alpha Vantage fallback
-    av_key = st.secrets.get("ALPHAVANTAGE_API_KEY", None) if hasattr(st, "secrets") else os.environ.get("ALPHAVANTAGE_API_KEY")
+    av_key = (
+        st.secrets.get("ALPHAVANTAGE_API_KEY", None)
+        if hasattr(st, "secrets")
+        else os.environ.get("ALPHAVANTAGE_API_KEY")
+    )
     if av_key:
         try:
             url = "https://www.alphavantage.co/query"
@@ -111,9 +121,10 @@ def fetch_history(ticker_sym, start_dt, end_dt, uploaded_bytes=None):
             }
             r = requests.get(url, params=params, timeout=15)
             if r.status_code == 200:
-                ts = r.json().get("Time Series (Daily)", {})
+                j = r.json()
+                ts = j.get("Time Series (Daily)") or j.get("Time Series (Daily Adjusted)")
                 if ts:
-                    df = pd.DataFrame.from_dict(ts, orient="index", dtype=float)
+                    df = pd.DataFrame.from_dict(ts, orient="index")
                     df.index = pd.to_datetime(df.index)
                     df = df.rename(
                         columns={
@@ -125,9 +136,16 @@ def fetch_history(ticker_sym, start_dt, end_dt, uploaded_bytes=None):
                             "6. volume": "Volume",
                         }
                     )
-                    cols = [c for c in ["Close", "Open", "High", "Low", "Volume"] if c in df.columns]
+                    # ensure numeric
+                    for c in df.columns:
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+                    cols = [
+                        c
+                        for c in ["Close", "Open", "High", "Low", "Volume"]
+                        if c in df.columns
+                    ]
                     out = df[cols].sort_index().loc[start_dt:end_dt]
-                    return out
+                    return out.dropna()
         except Exception as e:
             st.warning(f"Alpha Vantage fetch failed: {e}")
 
@@ -135,10 +153,19 @@ def fetch_history(ticker_sym, start_dt, end_dt, uploaded_bytes=None):
 
 # --- Metadata fetcher
 def fetch_company_metadata(ticker_sym):
-    meta = {"summary": None, "sector": None, "employees": None, "website": None, "ratios": {}}
+    meta = {
+        "summary": None,
+        "sector": None,
+        "employees": None,
+        "website": None,
+        "ratios": {},
+    }
 
-    # 1. Alpha Vantage overview
-    av_key = st.secrets.get("ALPHAVANTAGE_API_KEY", None) if hasattr(st, "secrets") else os.environ.get("ALPHAVANTAGE_API_KEY")
+    av_key = (
+        st.secrets.get("ALPHAVANTAGE_API_KEY", None)
+        if hasattr(st, "secrets")
+        else os.environ.get("ALPHAVANTAGE_API_KEY")
+    )
     if av_key:
         try:
             url = "https://www.alphavantage.co/query"
@@ -166,7 +193,6 @@ def fetch_company_metadata(ticker_sym):
         except Exception:
             pass
 
-    # 2. yfinance fallback
     if HAVE_YF:
         try:
             info = yf.Ticker(ticker_sym).get_info()
@@ -202,7 +228,9 @@ with meta_cols[2]:
     st.write(meta["website"] or "—")
 
 # Ratios
-left_df = pd.DataFrame(index=["Market Cap", "Beta", "EPS (trailing)", "PE Ratio (trailing)"])
+left_df = pd.DataFrame(
+    index=["Market Cap", "Beta", "EPS (trailing)", "PE Ratio (trailing)"]
+)
 left_df["value"] = [
     meta["ratios"].get("Market Cap"),
     meta["ratios"].get("Beta"),
@@ -210,7 +238,13 @@ left_df["value"] = [
     meta["ratios"].get("PE Ratio (trailing)"),
 ]
 right_df = pd.DataFrame(
-    index=["Quick Ratio", "Revenue per share", "Profit Margins", "Debt to Equity", "Return on Equity"]
+    index=[
+        "Quick Ratio",
+        "Revenue per share",
+        "Profit Margins",
+        "Debt to Equity",
+        "Return on Equity",
+    ]
 )
 right_df["value"] = [
     meta["ratios"].get("Quick Ratio"),
@@ -230,10 +264,14 @@ st.markdown("---")
 
 # Fetch prices
 uploaded_bytes = uploaded_csv.read() if uploaded_csv else None
-data = fetch_history(ticker, start_date.isoformat(), end_date.isoformat(), uploaded_bytes)
+data = fetch_history(
+    ticker, start_date.isoformat(), end_date.isoformat(), uploaded_bytes
+)
 
 if data.empty:
-    st.error("No historical price data available. Check ticker/network, upload CSV, or set ALPHAVANTAGE_API_KEY.")
+    st.error(
+        "No historical price data available. Check ticker/network, upload CSV, or set ALPHAVANTAGE_API_KEY."
+    )
 else:
     try:
         daily_change = data["Close"].iloc[-1] - data["Close"].iloc[-2]
@@ -262,9 +300,10 @@ else:
         if chart_type == "Candle":
             indicator = st.selectbox("Indicator", ("RSI", "MACD"))
         else:
-            indicator = st.selectbox("Indicator", ("RSI", "Moving Average", "MACD"))
+            indicator = st.selectbox(
+                "Indicator", ("RSI", "Moving Average", "MACD")
+            )
 
-    # Use data for 1y period
     def safe_plot(func):
         try:
             fig = func(data, "1y")
@@ -287,4 +326,7 @@ else:
         elif indicator == "MACD":
             safe_plot(MACD)
 
-st.caption("Notes: Uses Alpha Vantage for metadata and price fallback. Set `ALPHAVANTAGE_API_KEY` in Streamlit secrets or environment.")
+st.caption(
+    "Notes: Uses Alpha Vantage for metadata and price fallback. "
+    "Set `ALPHAVANTAGE_API_KEY` in Streamlit secrets or environment."
+)

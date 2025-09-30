@@ -57,21 +57,18 @@ if selected_saved and selected_saved != "(none)":
         st.error(f"Failed to load model: {e}")
 
 # --------- UI inputs ----------
-# support prefill via query params
 params = st.experimental_get_query_params()
 prefill_ticker = params.get("ticker", [None])[0]
 if prefill_ticker:
     prefill_ticker = str(prefill_ticker).upper()
 
-# Popular tickers list (you can edit this)
 popular = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "BRK-B", "JPM", "UNH"]
 options = popular + ["Other"]
 
-# determine default index based on prefill
 if prefill_ticker and prefill_ticker in popular:
     default_index = popular.index(prefill_ticker)
 elif prefill_ticker and prefill_ticker not in popular:
-    default_index = len(popular)  # "Other"
+    default_index = len(popular)
 else:
     default_index = 0
 
@@ -79,7 +76,6 @@ col1, col2, col3 = st.columns([1.5, 1, 1])
 with col1:
     sel = st.selectbox("Ticker", options=options, index=default_index)
     if sel == "Other":
-        # prefill custom input if query param provided and not in popular
         custom_value = prefill_ticker if (prefill_ticker and prefill_ticker not in popular) else ""
         custom_ticker = st.text_input("Enter ticker (e.g. AAPL)", value=custom_value)
         ticker = custom_ticker.strip().upper()
@@ -115,13 +111,13 @@ run_button = st.button("Fetch + Train (may take time)")
 def fetch_data(ticker, years, uploaded_csv_bytes=None, show_diagnostics=False):
     """
     Robust fetch:
-    1) If uploaded_csv_bytes provided -> parse CSV
-    2) Try yfinance.download(period=years)
-    3) Try yf.Ticker(...).history(period=years) (fallback)
-    4) Try pandas_datareader/stooq (lazy import)
-    Returns DataFrame with ['Close','Open','High','Low','Volume'] or empty DF.
+      1) uploaded CSV (if provided)
+      2) yfinance.download
+      3) yf.Ticker.history
+      4) pandas_datareader (stooq)
+      5) AlphaVantage (JSON) if ALPHAVANTAGE_API_KEY available in st.secrets or env
+    Returns DataFrame with ['Close','Open','High','Low','Volume'] or empty.
     """
-    # Helper to parse CSV bytes
     def parse_csv_bytes(b):
         try:
             df = pd.read_csv(io.BytesIO(b))
@@ -130,7 +126,7 @@ def fetch_data(ticker, years, uploaded_csv_bytes=None, show_diagnostics=False):
                 df = pd.read_csv(io.StringIO(b.decode()))
             except Exception:
                 return pd.DataFrame()
-        # try to find date col
+        # date col detection
         date_col = None
         for c in df.columns:
             if c.lower() in ("date", "timestamp", "time"):
@@ -143,7 +139,6 @@ def fetch_data(ticker, years, uploaded_csv_bytes=None, show_diagnostics=False):
         except Exception:
             return pd.DataFrame()
         df = df.set_index(date_col).sort_index()
-        # pick Close/Adj Close
         close_col = None
         for c in df.columns:
             if c.lower() in ("adj close", "adjusted_close", "adjusted close"):
@@ -156,19 +151,17 @@ def fetch_data(ticker, years, uploaded_csv_bytes=None, show_diagnostics=False):
                     break
         if close_col is None:
             return pd.DataFrame()
-        # attempt to also keep Open/High/Low/Volume if present
         cols = []
         for k in ["Open", "High", "Low", "Close", "Volume", "Adj Close"]:
             if k in df.columns:
                 cols.append(k)
-        # ensure Close is present
         if close_col not in cols:
             cols.append(close_col)
         out = df[cols].rename(columns={close_col: "Close"})
         out = out[["Close"] + [c for c in ["Open", "High", "Low", "Volume"] if c in out.columns]]
         return out
 
-    # 0) Uploaded CSV
+    # 0) uploaded CSV
     if uploaded_csv_bytes is not None:
         parsed = parse_csv_bytes(uploaded_csv_bytes)
         if not parsed.empty:
@@ -188,21 +181,15 @@ def fetch_data(ticker, years, uploaded_csv_bytes=None, show_diagnostics=False):
         if show_diagnostics:
             st.warning(f"yfinance.download failed for {ticker}: {e}")
 
-    # 2) yf.Ticker.history (fallback)
+    # 2) yf.Ticker.history fallback
     try:
         t = yf.Ticker(ticker)
         df = t.history(period=f"{years}y", actions=False)
         if df is not None and not df.empty:
-            # sometimes columns differ; normalize
-            cols = []
-            for c in ["Close", "Open", "High", "Low", "Volume", "Adj Close"]:
-                if c in df.columns:
-                    cols.append(c)
             if "Adj Close" in df.columns and "Close" not in df.columns:
                 df = df.rename(columns={"Adj Close": "Close"})
             if "Close" in df.columns:
-                out = df[['Close'] + [c for c in ["Open", "High", "Low", "Volume"] if c in df.columns]]
-                out = out.dropna()
+                out = df[['Close'] + [c for c in ["Open", "High", "Low", "Volume"] if c in df.columns]].dropna()
                 if not out.empty:
                     if show_diagnostics:
                         st.info(f"Fetched {len(out)} rows from yf.Ticker.history for {ticker}")
@@ -211,7 +198,7 @@ def fetch_data(ticker, years, uploaded_csv_bytes=None, show_diagnostics=False):
         if show_diagnostics:
             st.warning(f"yf.Ticker.history failed for {ticker}: {e}")
 
-    # 3) pandas_datareader -> stooq (lazy)
+    # 3) pandas_datareader -> stooq
     try:
         pdr_spec = importlib.util.find_spec("pandas_datareader")
         if pdr_spec is not None:
@@ -232,8 +219,72 @@ def fetch_data(ticker, years, uploaded_csv_bytes=None, show_diagnostics=False):
     except Exception:
         pass
 
-    # all failed -> return empty DF
+    # 4) AlphaVantage JSON fallback (if key present)
+    av_key = None
+    try:
+        av_key = st.secrets.get("ALPHAVANTAGE_API_KEY") if hasattr(st, "secrets") else None
+    except Exception:
+        av_key = None
+    if not av_key:
+        av_key = os.environ.get("ALPHAVANTAGE_API_KEY")
+
+    if av_key:
+        try:
+            import requests
+            url = "https://www.alphavantage.co/query"
+            params = {
+                "function": "TIME_SERIES_DAILY_ADJUSTED",
+                "symbol": ticker,
+                "outputsize": "full",
+                "apikey": av_key,
+                "datatype": "json"
+            }
+            r = requests.get(url, params=params, timeout=15)
+            if r.status_code == 200:
+                j = r.json()
+                # check for error messages
+                if "Error Message" in j or "Note" in j:
+                    if show_diagnostics:
+                        st.warning(f"AlphaVantage response for {ticker}: {j.get('Note') or j.get('Error Message')}")
+                ts = j.get("Time Series (Daily)") or j.get("Time Series (Daily Adjusted)")
+                if ts:
+                    df = pd.DataFrame.from_dict(ts, orient="index")
+                    df.index = pd.to_datetime(df.index)
+                    # columns typically: '1. open','2. high','3. low','4. close','5. adjusted close','6. volume', ...
+                    col_map = {}
+                    for c in df.columns:
+                        lc = c.lower()
+                        if "close" in lc and ("adjusted" in lc or lc.startswith("5.") or lc.endswith("adjusted") or "adjusted" in lc):
+                            col_map[c] = "Close"
+                        elif "close" in lc and "adjusted" not in lc:
+                            col_map[c] = col_map.get(c, "Close")
+                        elif "open" in lc:
+                            col_map[c] = "Open"
+                        elif "high" in lc:
+                            col_map[c] = "High"
+                        elif "low" in lc:
+                            col_map[c] = "Low"
+                        elif "volume" in lc:
+                            col_map[c] = "Volume"
+                    df = df.rename(columns=col_map)
+                    # keep numeric columns
+                    keep = [c for c in ["Close", "Open", "High", "Low", "Volume"] if c in df.columns]
+                    if "Close" in keep:
+                        out = df[keep].sort_index().astype(float).dropna()
+                        if not out.empty:
+                            if show_diagnostics:
+                                st.info(f"Fetched {len(out)} rows from AlphaVantage for {ticker}")
+                            return out
+            else:
+                if show_diagnostics:
+                    st.warning(f"AlphaVantage HTTP {r.status_code} for {ticker}")
+        except Exception as e:
+            if show_diagnostics:
+                st.warning(f"AlphaVantage attempt failed for {ticker}: {e}")
+
+    # All attempts failed
     return pd.DataFrame()
+
 
 def add_lag_features(df, n_lags):
     df2 = df.copy()
@@ -260,7 +311,7 @@ def compute_metrics(y_true, y_pred):
     r2 = r2_score(y_true, y_pred)
     return {'RMSE': rmse, 'MAE': mae, 'R2': r2}
 
-# param grids
+# param grids (same as before)
 rf_param_dist = {
     "n_estimators": [50, 100, 200, 300],
     "max_depth": [None, 5, 10, 20],
@@ -314,15 +365,13 @@ if LOADED_MODEL is not None:
         if do_quick:
             with st.spinner("Fetching recent market data and running forecast..."):
                 try:
-                    # fetch a bit more history to compute indicators / lags
                     recent_days = max(60, n_lags * 3)
                     uploaded_bytes = csv_upload.read() if csv_upload is not None else None
                     df_recent = fetch_data(ticker, 1, uploaded_csv_bytes=uploaded_bytes, show_diagnostics=True)
                     if df_recent.empty:
-                        st.error("Failed to fetch recent data for ticker. Try uploading a CSV or check network/ticker symbol.")
+                        st.error("Failed to fetch recent data for ticker. Try uploading a CSV or check network/ticker symbol and ALPHAVANTAGE_API_KEY.")
                     else:
                         df_recent = df_recent.tail(recent_days).copy()
-                        # build features same way we do for training
                         df_feat_recent = add_lag_features(df_recent, n_lags)
                         if add_tech:
                             df_feat_recent = add_technical_indicators(df_feat_recent)
@@ -334,47 +383,36 @@ if LOADED_MODEL is not None:
                             model_obj = LOADED_MODEL['model']
                             scaler_obj = LOADED_MODEL['scaler']
 
-                            # Ensure all saved features are present (if not, try to fill missing with zeros)
                             missing = [f for f in feature_names if f not in df_feat_recent.columns]
                             if missing:
                                 st.warning(f"Some features from saved model are missing in recent data: {missing}. Filling with zeros.")
                                 for m in missing:
                                     df_feat_recent[m] = 0.0
-                            # Prepare last feature row
                             last_row = df_feat_recent.iloc[-1:].copy()
-                            # order columns as saved
                             last_row = last_row.reindex(columns=feature_names, fill_value=0.0)
 
-                            # Determine model type (sklearn/xgboost vs TF)
                             model_module = type(model_obj).__module__ if model_obj is not None else ""
                             if 'tensorflow' in model_module or 'keras' in model_module:
                                 st.warning("Loaded model appears to be a TF/Keras model. This quick recursive routine currently supports sklearn/xgboost tree models. For LSTM saved-model inference, use a dedicated routine.")
                             else:
-                                # recursive 7-day forecast
                                 forecasts = []
                                 cur_row = last_row.copy()
                                 for step in range(7):
                                     X_cur = cur_row.values.astype(float)
-                                    # scale
                                     Xs = scaler_obj.transform(X_cur)
                                     pred = model_obj.predict(Xs)[0]
                                     forecasts.append(pred)
-
-                                    # update cur_row: shift lag columns if present
                                     lag_cols = [c for c in feature_names if c.startswith('lag_')]
                                     lag_cols_sorted = sorted(lag_cols, key=lambda x: int(x.split('_')[1])) if lag_cols else []
                                     if lag_cols_sorted:
-                                        # shift: lag_n = lag_{n-1}, lag_1 = pred
                                         for i in range(len(lag_cols_sorted)-1, 0, -1):
                                             cur_row[lag_cols_sorted[i]] = cur_row[lag_cols_sorted[i-1]].values
                                         cur_row[lag_cols_sorted[0]] = pred
 
-                                # Build forecast DataFrame with dates
                                 last_date = df_recent.index[-1]
-                                future_idx = pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=7)  # business days
+                                future_idx = pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=7)
                                 forecast_df = pd.DataFrame({'Forecast': forecasts}, index=future_idx)
 
-                                # Plot last 60 days and forecast
                                 plot_hist = pd.concat([df_recent['Close'].tail(60), forecast_df['Forecast']])
                                 st.line_chart(plot_hist)
 
@@ -387,7 +425,6 @@ if LOADED_MODEL is not None:
 
 # --------- Training pipeline ----------
 if run_button:
-    # validate ticker
     if not ticker or str(ticker).strip() == "":
         st.error("Please enter a ticker symbol (or pick one from the dropdown).")
         st.stop()
@@ -395,7 +432,18 @@ if run_button:
     uploaded_bytes = csv_upload.read() if csv_upload is not None else None
     data = fetch_data(ticker, years, uploaded_csv_bytes=uploaded_bytes, show_diagnostics=True)
     if data.empty:
-        st.error("No data fetched. Check ticker, network, or upload a CSV with Date + Close column.")
+        # helpful hint about AlphaVantage
+        av_key = None
+        try:
+            av_key = st.secrets.get("ALPHAVANTAGE_API_KEY") if hasattr(st, "secrets") else None
+        except Exception:
+            av_key = None
+        if not av_key:
+            av_key = os.environ.get("ALPHAVANTAGE_API_KEY")
+        if av_key:
+            st.error("No data fetched from primary sources. AlphaVantage key present — the request likely failed (rate limit or symbol). Try uploading CSV or try another ticker.")
+        else:
+            st.error("No data fetched. Check ticker, network, or upload a CSV with Date + Close column. To enable AlphaVantage fallback, set ALPHAVANTAGE_API_KEY in Streamlit secrets or environment.")
         st.stop()
 
     st.success(f"Fetched {len(data)} rows for {ticker}")
@@ -427,6 +475,7 @@ if run_button:
     trained = {}
     results = {}
 
+    # (training loop unchanged from your original file)
     for mname in models_to_train:
         if mname == "RandomForest":
             st.info("Preparing RandomForest...")
@@ -480,13 +529,11 @@ if run_button:
         else:
             st.warning(f"Unknown model requested: {mname}")
 
-    # Show comparison table
     if results:
         metrics_df = pd.DataFrame(results).T
         st.subheader("Model comparison")
         st.dataframe(metrics_df[['RMSE', 'MAE', 'R2']].sort_values(by='RMSE'))
 
-    # Inspect & save
     if trained:
         sel = st.selectbox("Select a trained model to inspect or save", list(trained.keys()))
         if sel:
